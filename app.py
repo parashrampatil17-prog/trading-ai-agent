@@ -12,7 +12,32 @@ API_SECRET = os.environ.get("KITE_API_SECRET")
 
 kite = KiteConnect(api_key=API_KEY) if API_KEY else None
 ACCESS_TOKEN = None
+TG_TOKEN = os.environ.get("TG_TOKEN")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
+
+def send_telegram(message):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+
+        response = requests.post(
+            url,
+            data={
+                "chat_id": TG_CHAT_ID,
+                "text": message
+            },
+            timeout=10
+        )
+
+        response.raise_for_status()
+        return True
+
+    except Exception as e:
+        print("Telegram Error:", e)
+        return False
 STOCKS = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN",
     "INFY", "TCS", "LT", "AXISBANK", "BHARTIARTL",
