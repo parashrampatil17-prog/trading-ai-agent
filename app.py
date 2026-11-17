@@ -327,9 +327,120 @@ async function scan() {
     }
 }
 
-updateMarket();
-scan();
-setInterval(updateMarket, 20000);
+async function loadOptions() {
+    const underlying = document.getElementById("underlying").value;
+    const status = document.getElementById("optionStatus");
+    const resultDiv = document.getElementById("optionResult");
+
+    status.innerText = "Loading Option Chain...";
+    resultDiv.innerHTML = "";
+
+    try {
+        const response = await fetch("/api/options/" + underlying);
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+            throw new Error(data.error || "API Error");
+        }
+
+        status.innerText = underlying + " | Expiry: " + data.expiry;
+
+        resultDiv.innerHTML = `
+            <h3>Spot: ${data.spot_price}</h3>
+            <h3>ATM: ${data.atm_strike}</h3>
+            <p>PCR: ${data.pcr}</p>
+            <p>Max Pain: ${data.max_pain}</p>
+            <p>Support: ${data.support}</p>
+            <p>Resistance: ${data.resistance}</p>
+            <p>Total CE OI: ${data.total_ce_oi}</p>
+            <p>Total PE OI: ${data.total_pe_oi}</p>
+
+            <div style="overflow-x:auto">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>CE OI</th>
+                            <th>CE LTP</th>
+                            <th>STRIKE</th>
+                            <th>PE LTP</th>
+                            <th>PE OI</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${data.option_chain.map(row => `
+                            <tr>
+                                <td>${row.CE.oi}</td>
+                                <td>${row.CE.ltp}</td>
+                                <td><b>${row.strike}</b></td>
+                                <td>${row.PE.ltp}</td>
+                                <td>${row.PE.oi}</td>
+                            </tr>
+                        `).join("")}
+                    </tbody>
+                </table>
+            </div>
+        `;
+
+    } catch (error) {
+        status.innerText = "Error: " + error.message;
+    }
+}
+    status.innerText = "Loading Option Chain...";
+    resultDiv.innerHTML = "";
+
+    try {
+        const response = await fetch("/api/options/" + underlying);
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+            throw new Error(data.error || "API Error");
+        }
+
+        status.innerText =
+            underlying + " | Expiry: " + data.expiry;
+
+        resultDiv.innerHTML = `
+            <h3>Spot: ${data.spot_price}</h3>
+            <h3>ATM: ${data.atm_strike}</h3>
+
+            <p>PCR: ${data.pcr}</p>
+            <p>Max Pain: ${data.max_pain}</p>
+            <p>Support: ${data.support}</p>
+            <p>Resistance: ${data.resistance}</p>
+
+            <p>Total CE OI: ${data.total_ce_oi}</p>
+            <p>Total PE OI: ${data.total_pe_oi}</p>
+
+            <div style="overflow-x:auto">
+            <table>
+                <thead>
+                    <tr>
+                        <th>CE OI</th>
+                        <th>CE LTP</th>
+                        <th>STRIKE</th>
+                        <th>PE LTP</th>
+                        <th>PE OI</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${data.option_chain.map(row => `
+                        <tr>
+                            <td>${row.CE.oi}</td>
+                            <td>${row.CE.ltp}</td>
+                            <td><b>${row.strike}</b></td>
+                            <td>${row.PE.ltp}</td>
+                            <td>${row.PE.oi}</td>
+                        </tr>
+                    `).join("")}
+                </tbody>
+            </table>
+            </div>
+        `;
+
+    } catch (error) {
+        status.innerText = "Error: " + error.message;
+    }
+}
 </script>
 
 </body>
