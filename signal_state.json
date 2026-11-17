@@ -1,0 +1,16 @@
+{
+  "RELIANCE": true,
+  "HDFCBANK": true,
+  "ICICIBANK": true,
+  "SBIN": true,
+  "INFY": false,
+  "TCS": true,
+  "LT": true,
+  "AXISBANK": true,
+  "BHARTIARTL": true,
+  "ITC": true,
+  "MARUTI": false,
+  "SUNPHARMA": false,
+  "NTPC": false,
+  "POWERGRID": false
+}
