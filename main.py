@@ -1,31 +1,25 @@
-import os
-import requests
-from datetime import datetime
+name: Trading AI Agent
 
-BOT_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("TG_CHAT_ID")
+on:
+  workflow_dispatch:
 
-def send_alert(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram credentials not configured")
-        return
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(
-        url,
-        data={"chat_id": CHAT_ID, "text": message},
-        timeout=15
-    )
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-def main():
-    print("Trading AI Agent Started")
+      - name: Install dependencies
+        run: pip install requests
 
-    message = (
-        "Trading AI Agent Started Successfully!\n"
-        + datetime.now().strftime("%d-%m-%Y %H:%M")
-    )
-
-    send_alert(message)
-
-if __name__ == "__main__":
-    main()
+      - name: Run Trading Agent
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python main.py
