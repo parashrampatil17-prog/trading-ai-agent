@@ -772,7 +772,20 @@ def options_api(underlying):
 
 
 # ---------------- HEALTH CHECK ----------------
+@app.route("/test-telegram")
+def test_telegram():
 
+    if not ACCESS_TOKEN:
+        return "Please login with Zerodha first", 401
+
+    success = send_telegram(
+        "✅ Trading AI Dashboard: Telegram connection successful!"
+    )
+
+    if success:
+        return "Telegram Test Alert Sent Successfully!"
+
+    return "Telegram Alert Failed. Check Render Environment Variables.", 500
 @app.route("/health")
 def health():
 
