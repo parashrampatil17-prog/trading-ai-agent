@@ -401,18 +401,13 @@ def scanner():
 
 @app.route("/api/options/<underlying>")
 def options_api(underlying):
-
     if not ACCESS_TOKEN:
-        return jsonify({
-            "error": "Please login with Zerodha"
-        }), 401
+        return jsonify({"error": "Please login with Zerodha"}), 401
 
     if underlying not in ["NIFTY", "SENSEX"]:
-        return jsonify({
-            "error": "Invalid underlying"
-        }), 400
+        return jsonify({"error": "Invalid underlying"}), 400
 
-        try:
+    try:
         symbols = {
             "NIFTY": "NSE:NIFTY 50",
             "SENSEX": "BSE:SENSEX"
@@ -422,19 +417,18 @@ def options_api(underlying):
         spot_price = spot_data[symbols[underlying]]["last_price"]
 
         result = get_option_analysis(
-            kite,
-            underlying,
-            spot_price
+            kite, underlying, spot_price
         )
 
         return jsonify(result)
 
     except Exception as e:
-        return jsonify({
-            "error": str(e)
-        }), 502
-            "error": str(e)
-        }), 502
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/health")
+def health():
+    return "Trading AI Agent Running"
 @app.route("/health")
 def health():
     return "Trading AI Agent Running"
