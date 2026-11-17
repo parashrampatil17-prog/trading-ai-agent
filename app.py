@@ -171,7 +171,29 @@ def scan_stocks():
 
 
 # ---------------- DASHBOARD ----------------
+# ---------------- MARKET SUMMARY ----------------
 
+def get_market_summary():
+    results = scan_stocks()
+
+    bullish = sum(
+        1 for stock in results
+        if stock["signal"] == "BULLISH WATCH"
+    )
+
+    bearish = sum(
+        1 for stock in results
+        if stock["signal"] == "BEARISH WATCH"
+    )
+
+    neutral = len(results) - bullish - bearish
+
+    return {
+        "total_stocks": len(results),
+        "bullish": bullish,
+        "bearish": bearish,
+        "neutral": neutral
+    }
 @app.route("/")
 def home():
 
