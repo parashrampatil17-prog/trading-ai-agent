@@ -775,14 +775,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
     )
-
-आता काय करायचे?
-
-1. GitHub मधील "app.py" उघडा.
-2. जुना पूर्ण कोड Select All करून काढा.
-3. वरील पूर्ण कोड पेस्ट करा.
-4. Commit करण्यापूर्वी मला सांगा.
-
-लक्षात ठेवा: हा Market Summary 15 Stocks च्या Daily Data वर आधारित आहे. BUY/SELL ऑर्डर देत नाही. Zerodha Access Token Render restart झाल्यावर पुन्हा Login करावा लागू शकतो.
-
-पेस्ट करताना अडचण आली तर स्क्रीनशॉट पाठवा.
