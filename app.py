@@ -420,8 +420,7 @@ def options_api(underlying):
 
         spot_data = kite.ltp(symbols[underlying])
 
-spot_price = spot_data[symbols[underlying]]["last_price"]
-
+            spot_price = spot_data[symbols[underlying]]["last_price"]
         result = get_option_analysis(
             kite,
             underlying,
