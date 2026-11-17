@@ -1,26 +1,35 @@
-name: Trading AI Agent
+import os
+import requests
+from datetime import datetime
 
-on:
-  workflow_dispatch:
+BOT_TOKEN = os.getenv("TG_TOKEN")
+CHAT_ID = os.getenv("TG_CHAT_ID")
 
-jobs:
-  run-agent:
-    runs-on: ubuntu-latest
+def send_alert(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        raise ValueError("Telegram secrets are missing")
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": message
+        },
+        timeout=15
+    )
 
-      - name: Install dependencies
-        run: pip install requests
+    response.raise_for_status()
+    print("Telegram alert sent successfully!")
 
-      - name: Run Trading Agent
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python main.py
+def main():
+    message = (
+        "Trading AI Agent Started Successfully! 🚀\n"
+        + datetime.now().strftime("%d-%m-%Y %H:%M")
+    )
+
+    send_alert(message)
+
+if __name__ == "__main__":
+    main()
