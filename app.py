@@ -1,10 +1,11 @@
 import os
+import gc
 import requests
 from datetime import datetime
 from flask import Flask, redirect, request, jsonify, render_template_string
 from kiteconnect import KiteConnect
 from options_engine import get_option_analysis
-from hilega_milega_scanner import scan_all as scan_hilega_all
+from hilega_milega_scanner import NIFTY50, scan as scan_hilega_stock
 
 app = Flask(__name__)
 API_KEY = os.environ.get("KITE_API_KEY")
@@ -178,10 +179,10 @@ function chainHtml(d){return `<h3>Spot: ${d.spot_price}</h3><h3>ATM: ${d.atm_str
 ${d.option_chain.map(x=>`<tr><td>${x.CE?.oi??"-"}</td><td>${x.CE?.ltp??"-"}</td><td><b>${x.strike}</b></td><td>${x.PE?.ltp??"-"}</td><td>${x.PE?.oi??"-"}</td></tr>`).join("")}</tbody></table></div>`;}
 async function loadOptions(){let u=document.getElementById("underlying").value,s=document.getElementById("optionStatus"),o=document.getElementById("optionResult");s.innerText="Loading...";o.innerHTML="";
 try{let r=await fetch("/api/options/"+u),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API Error");s.innerText=u+" option chain";o.innerHTML=chainHtml(d);}catch(e){s.innerText="Error: "+e.message;}}
-async function loadHilega(){let s=document.getElementById("hilegaStatus"),tb=document.getElementById("hilegaRows");s.innerText="Scanning NIFTY 50...";
-try{let r=await fetch("/api/hilega"),d=await r.json();if(!r.ok)throw Error(d.error||"Scan failed");tb.innerHTML="";
-d.results.forEach(x=>{tb.innerHTML+=`<tr><td>${x.symbol}</td><td>${x.close}</td><td>${x.rsi}</td><td>${x.entry}</td><td>${x.stop_loss}</td><td>${x.target1}</td><td>${x.target2}</td><td class="green">${x.signal}</td></tr>`;});
-s.innerText=`Scan complete: ${d.scanned} checked, ${d.results.length} BUY candidates. ${d.updated}`;}catch(e){s.innerText="Error: "+e.message;}}
+async function loadHilega(){let s=document.getElementById("hilegaStatus"),tb=document.getElementById("hilegaRows");s.innerText="Scanning NIFTY 50 in 5 batches...";tb.innerHTML="";let all=[];let scanned=0;
+try{for(let batch=0;batch<5;batch++){s.innerText=`Scanning batch ${batch+1}/5 (10 stocks)...`;let r=await fetch(`/api/hilega?batch=${batch}`);let d=await r.json();if(!r.ok)throw Error(d.error||`Batch ${batch+1} failed`);all=all.concat(d.results||[]);scanned+=d.scanned||0;}
+all.forEach(x=>{tb.innerHTML+=`<tr><td>${x.symbol}</td><td>${x.close}</td><td>${x.rsi}</td><td>${x.entry}</td><td>${x.stop_loss}</td><td>${x.target1}</td><td>${x.target2}</td><td class="green">${x.signal}</td></tr>`;});
+s.innerText=`Scan complete: ${scanned} checked, ${all.length} BUY candidates.`;}catch(e){s.innerText="Error: "+e.message;}}
 async function sendHilegaAlerts(){let s=document.getElementById("hilegaStatus");s.innerText="Sending Telegram alert...";
 try{let r=await fetch("/api/hilega/telegram",{method:"POST"}),d=await r.json();if(!r.ok)throw Error(d.error||"Telegram failed");s.innerText=d.message;}catch(e){s.innerText="Error: "+e.message;}}
 async function loadStockOptions(){let sym=document.getElementById("stockOptionSymbol").value.trim().toUpperCase(),s=document.getElementById("stockOptionStatus"),o=document.getElementById("stockOptionResult");
@@ -242,28 +243,61 @@ def scanner():
     except Exception as exc:
         return jsonify({"error":str(exc)}),502
 
+def run_hilega_batches():
+    """Run the full scan in groups of ten, collecting results and freeing memory."""
+    all_rows=[]
+    for start in range(0,len(NIFTY50),10):
+        for symbol in NIFTY50[start:start+10]:
+            try:
+                result=scan_hilega_stock(symbol)
+                if result:
+                    all_rows.append(result)
+            except Exception as exc:
+                print(f"Hilega scanner skipped {symbol}: {exc}")
+            finally:
+                gc.collect()
+        gc.collect()
+    return all_rows
+
 @app.route("/api/hilega")
 def hilega_api():
     try:
-        rows=scan_hilega_all()
-        return jsonify({"results":rows,"scanned":50,"updated":datetime.now().isoformat(),
-                        "note":"Approximation of the Chartink conditions supplied; verify against Chartink."})
+        batch=int(request.args.get("batch", "0"))
+        total_batches=(len(NIFTY50)+9)//10
+        if batch<0 or batch>=total_batches:
+            return jsonify({"error":f"batch must be between 0 and {total_batches-1}"}),400
+        symbols=NIFTY50[batch*10:(batch+1)*10]
+        rows=[]
+        for symbol in symbols:
+            try:
+                result=scan_hilega_stock(symbol)
+                if result:
+                    rows.append(result)
+            except Exception as exc:
+                print(f"Hilega scanner skipped {symbol}: {exc}")
+            finally:
+                gc.collect()
+        return jsonify({"results":rows,"scanned":len(symbols),"batch":batch+1,
+                        "total_batches":total_batches,"updated":datetime.now().isoformat(),
+                        "note":"Approximation of Chartink conditions; verify signals in Chartink."})
     except Exception as exc:
+        print("Hilega API error:",repr(exc))
         return jsonify({"error":str(exc)}),502
 
 @app.route("/api/hilega/telegram",methods=["POST"])
 def hilega_telegram():
     try:
-        rows=scan_hilega_all()
+        rows=run_hilega_batches()
         if not rows:
             return jsonify({"message":"Scan complete: no BUY candidates; no Telegram alert sent."})
         lines=["HILEGA MILEGA — NIFTY 50","Research alerts only:"]
         for x in rows[:20]:
             lines.append(f'{x["symbol"]} BUY WATCH | Close {x["close"]} | RSI9 {x["rsi"]} | SL {x["stop_loss"]} | T1 {x["target1"]} | T2 {x["target2"]}')
-        if not send_telegram("\\n".join(lines)):
+        if not send_telegram("\n".join(lines)):
             return jsonify({"error":"Telegram send failed. Check TG_TOKEN and TG_CHAT_ID."}),500
         return jsonify({"message":f"Telegram alert sent for {min(len(rows),20)} candidate(s)."})
     except Exception as exc:
+        print("Hilega Telegram error:",repr(exc))
         return jsonify({"error":str(exc)}),502
 
 @app.route("/api/options/<underlying>")
