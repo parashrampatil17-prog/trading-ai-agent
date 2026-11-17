@@ -7,6 +7,7 @@ BOT_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("TG_CHAT_ID")
 
 STATE_FILE = "signal_state.json"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 STOCKS = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN",
@@ -15,7 +16,10 @@ STOCKS = [
     "NTPC", "POWERGRID"
 ]
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+MARKETS = {
+    "NIFTY": "^NSEI",
+    "SENSEX": "^BSESN"
+}
 
 
 def load_state():
@@ -34,7 +38,7 @@ def save_state(state):
 def get_data(symbol):
     url = (
         f"https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{symbol}.NS?range=3mo&interval=1d"
+        f"{symbol}?range=3mo&interval=1d"
     )
 
     response = requests.get(
@@ -42,10 +46,22 @@ def get_data(symbol):
     )
     response.raise_for_status()
 
-    data = response.json()["chart"]["result"][0]
-    closes = data["indicators"]["quote"][0]["close"]
+    result = response.json()["chart"]["result"]
 
-    return [x for x in closes if x is not None]
+    if not result:
+        raise ValueError("Market data unavailable")
+
+    quote = result[0]["indicators"]["quote"][0]
+
+    closes = quote["close"]
+    highs = quote["high"]
+    lows = quote["low"]
+
+    return [
+        (c, h, l)
+        for c, h, l in zip(closes, highs, lows)
+        if c is not None and h is not None and l is not None
+    ]
 
 
 def ema(values, period):
@@ -80,6 +96,7 @@ def rsi(values, period=14):
         avg_gain = (
             avg_gain * (period - 1) + gain
         ) / period
+
         avg_loss = (
             avg_loss * (period - 1) + loss
         ) / period
@@ -109,62 +126,115 @@ def send_telegram(message):
     response.raise_for_status()
 
 
+def analyze_market(rows):
+    closes = [r[0] for r in rows]
+    highs = [r[1] for r in rows]
+    lows = [r[2] for r in rows]
+
+    if len(closes) < 50:
+        return None
+
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    strength = rsi(closes)
+
+    price = closes[-1]
+
+    resistance = max(highs[-21:-1])
+    support = min(lows[-21:-1])
+
+    signal = "NEUTRAL"
+
+    if price > resistance and e20 > e50 and strength > 50:
+        signal = "BULLISH BREAKOUT"
+
+    elif price < support and e20 < e50 and strength < 50:
+        signal = "BEARISH BREAKDOWN"
+
+    elif e20 > e50 and strength > 55:
+        signal = "BULLISH TREND"
+
+    elif e20 < e50 and strength < 45:
+        signal = "BEARISH TREND"
+
+    return {
+        "signal": signal,
+        "price": round(price, 2),
+        "ema20": round(e20, 2),
+        "ema50": round(e50, 2),
+        "rsi": round(strength, 2),
+        "support": round(support, 2),
+        "resistance": round(resistance, 2)
+    }
+
+
 def main():
+
     state = load_state()
-    new_signals = []
+    new_state = dict(state)
+    alerts = []
 
-    print("Trading AI Agent started")
+    print("TRADING AI AGENT STARTED")
 
-    for stock in STOCKS:
+    instruments = list(MARKETS.items())
+
+    instruments += [
+        (stock, stock + ".NS")
+        for stock in STOCKS
+    ]
+
+    for name, symbol in instruments:
+
         try:
-            values = get_data(stock)
+            rows = get_data(symbol)
+            result = analyze_market(rows)
 
-            if len(values) < 50:
+            if result is None:
                 continue
 
-            e20 = ema(values, 20)
-            e50 = ema(values, 50)
-            strength = rsi(values)
+            signal = result["signal"]
+            old_signal = state.get(name, "NEUTRAL")
 
-            if e20 is None or e50 is None or strength is None:
-                continue
+            new_state[name] = signal
 
-            bullish = e20 > e50 and strength > 50
-            previous_bullish = state.get(stock, False)
+            if signal != "NEUTRAL" and signal != old_signal:
 
-            if bullish and not previous_bullish:
-                new_signals.append(
-                    f"🟢 {stock}\n"
-                    f"Price: {values[-1]:.2f}\n"
-                    f"EMA20: {e20:.2f}\n"
-                    f"EMA50: {e50:.2f}\n"
-                    f"RSI: {strength:.2f}\n"
-                    f"BULLISH WATCH"
+                alert = (
+                    f"🔔 NEW SIGNAL: {name}\n\n"
+                    f"Signal: {signal}\n"
+                    f"Price: {result['price']}\n"
+                    f"EMA20: {result['ema20']}\n"
+                    f"EMA50: {result['ema50']}\n"
+                    f"RSI: {result['rsi']}\n"
+                    f"Support: {result['support']}\n"
+                    f"Resistance: {result['resistance']}"
                 )
 
-            state[stock] = bullish
+                alerts.append(alert)
 
-            print(stock, "Bullish" if bullish else "No signal")
+            print(name, signal)
 
         except Exception as error:
-            print(stock, "Error:", error)
+            print(name, "ERROR:", error)
 
-    save_state(state)
+    if alerts:
 
-    if new_signals:
         message = (
             "🚀 TRADING AI AGENT\n"
-            f"{datetime.now().strftime('%d-%m-%Y %H:%M')}\n\n"
-            "NEW BULLISH SIGNALS\n\n"
-            + "\n\n".join(new_signals)
-            + "\n\n⚠️ Watchlist only. Verify before trading."
+            + datetime.now().strftime("%d-%m-%Y %H:%M")
+            + "\n\n"
+            + "\n\n----------------\n\n".join(alerts)
+            + "\n\n⚠️ Research alerts only. Verify before trading."
         )
 
         send_telegram(message)
-        print("New signal alert sent")
+
+        print("New alerts sent:", len(alerts))
 
     else:
-        print("No new bullish signals")
+        print("No new signals.")
+
+    save_state(new_state)
 
 
 if __name__ == "__main__":
