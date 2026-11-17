@@ -1,1 +1,5 @@
+
+flask
+kiteconnect
+gunicorn
 requests
