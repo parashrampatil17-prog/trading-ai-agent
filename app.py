@@ -429,9 +429,6 @@ def options_api(underlying):
 @app.route("/health")
 def health():
     return "Trading AI Agent Running"
-@app.route("/health")
-def health():
-    return "Trading AI Agent Running"
 
 
 if __name__ == "__main__":
