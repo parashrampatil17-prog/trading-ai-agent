@@ -2,3 +2,6 @@ flask
 kiteconnect
 gunicorn
 requests
+yfinance
+pandas
+numpy
