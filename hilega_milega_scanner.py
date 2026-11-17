@@ -1,20 +1,23 @@
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import time
 
+# NIFTY 50 - 50 STOCKS
 NIFTY50 = [
     "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT",
     "AXISBANK", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV",
-    "BEL", "BHARTIARTL", "CIPLA", "COALINDIA", "DRREDDY",
-    "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH",
-    "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO",
-    "HINDUNILVR", "ICICIBANK", "INDUSINDBK", "INFY",
-    "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT",
-    "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
-    "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
-    "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATASTEEL",
-    "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO",
-    "WIPRO"
+    "BEL", "BHARTIARTL", "CIPLA", "COALINDIA",
+    "DRREDDY", "EICHERMOT", "ETERNAL", "GRASIM",
+    "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO",
+    "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
+    "INFY", "ITC", "JIOFIN", "JSWSTEEL",
+    "KOTAKBANK", "LT", "M&M", "MARUTI",
+    "NESTLEIND", "NTPC", "ONGC", "POWERGRID",
+    "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN",
+    "SUNPHARMA", "TATACONSUM", "TATASTEEL", "TCS",
+    "TECHM", "TITAN", "TRENT", "ULTRACEMCO",
+    "WIPRO", "TMPV"
 ]
 
 PERIOD = 9
@@ -50,21 +53,21 @@ def calculate_rsi(close, period=9):
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    result = 100 - 100 / (1 + rs)
+    rsi = 100 - (100 / (1 + rs))
 
-    result = result.mask(
+    rsi = rsi.mask(
         (avg_loss == 0) & (avg_gain > 0), 100
     )
 
-    result = result.mask(
+    rsi = rsi.mask(
         (avg_gain == 0) & (avg_loss > 0), 0
     )
 
-    return result
+    return rsi
 
 
 def calculate_wma(series, period=9):
-    weights = np.arange(1, period + 1, dtype=float)
+    weights = np.arange(1, period + 1)
 
     return series.rolling(period).apply(
         lambda x: np.dot(x, weights) / weights.sum(),
@@ -80,111 +83,94 @@ def calculate_ema(series, period=9):
     ).mean()
 
 
+def download_data(ticker, period, interval):
+    return yf.download(
+        ticker,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=True,
+        threads=False,
+        timeout=20
+    )
+
+
 def scan(symbol):
 
     ticker = symbol + ".NS"
 
-    daily = yf.download(
-        ticker,
-        period="1y",
-        interval="1d",
-        progress=False,
-        auto_adjust=True
-    )
-
-    weekly = yf.download(
-        ticker,
-        period="2y",
-        interval="1wk",
-        progress=False,
-        auto_adjust=True
-    )
-
-    monthly = yf.download(
-        ticker,
-        period="5y",
-        interval="1mo",
-        progress=False,
-        auto_adjust=True
-    )
+    daily = download_data(ticker, "1y", "1d")
+    weekly = download_data(ticker, "2y", "1wk")
+    monthly = download_data(ticker, "5y", "1mo")
 
     if daily.empty or weekly.empty or monthly.empty:
         return None
 
-    d_close = get_col(daily, "Close")
-    w_close = get_col(weekly, "Close")
-    m_close = get_col(monthly, "Close")
+    dc = get_col(daily, "Close")
+    wc = get_col(weekly, "Close")
+    mc = get_col(monthly, "Close")
+
     volume = get_col(daily, "Volume")
 
-    if min(len(d_close), len(w_close), len(m_close)) < 20:
+    if min(len(dc), len(wc), len(mc)) < 20:
         return None
 
     if len(volume) < 2:
         return None
 
-    d_rsi = calculate_rsi(d_close)
-    w_rsi = calculate_rsi(w_close)
-    m_rsi = calculate_rsi(m_close)
+    daily_rsi = calculate_rsi(dc)
+    weekly_rsi = calculate_rsi(wc)
+    monthly_rsi = calculate_rsi(mc)
 
-    d_ema = calculate_ema(d_rsi)
-    d_wma = calculate_wma(d_rsi)
+    daily_ema = calculate_ema(daily_rsi)
+    daily_wma = calculate_wma(daily_rsi)
 
-    w_ema = calculate_ema(w_rsi)
-    w_wma = calculate_wma(w_rsi)
+    weekly_ema = calculate_ema(weekly_rsi)
+    weekly_wma = calculate_wma(weekly_rsi)
 
-    m_wma = calculate_wma(m_rsi)
+    monthly_wma = calculate_wma(monthly_rsi)
 
     indicators = [
-        d_rsi, d_ema, d_wma,
-        w_ema, w_wma, m_wma
+        daily_rsi,
+        daily_ema,
+        daily_wma,
+        weekly_ema,
+        weekly_wma,
+        monthly_wma
     ]
 
     if any(x.dropna().empty for x in indicators):
         return None
 
-    close = float(d_close.iloc[-1])
-    previous_close = float(d_close.iloc[-2])
+    close = float(dc.iloc[-1])
+    previous_close = float(dc.iloc[-2])
     current_volume = int(volume.iloc[-1])
 
-    conditions = [
-
-        # Daily RSI above 50
-        float(d_rsi.iloc[-1]) > 50,
-
-        # Monthly RSI WMA below 50
-        float(m_wma.iloc[-1]) < 50,
-
-        # Weekly RSI WMA below 50
-        float(w_wma.iloc[-1]) < 50,
-
-        # Weekly EMA above WMA
-        float(w_ema.iloc[-1]) > float(w_wma.iloc[-1]),
-
-        # Daily EMA above WMA
-        float(d_ema.iloc[-1]) > float(d_wma.iloc[-1]),
-
-        # Daily positive change
+    checks = [
+        float(daily_rsi.iloc[-1]) > 50,
+        float(monthly_wma.iloc[-1]) < 50,
+        float(weekly_wma.iloc[-1]) < 50,
+        float(weekly_ema.iloc[-1]) > float(weekly_wma.iloc[-1]),
+        float(daily_ema.iloc[-1]) > float(daily_wma.iloc[-1]),
         close > previous_close,
-
-        # Volume above 50000
         current_volume > VOLUME_MIN
     ]
 
-    if not all(conditions):
+    if not all(checks):
         return None
 
     high = get_col(daily, "High")
     low = get_col(daily, "Low")
 
-    previous = d_close.shift(1)
+    previous = dc.shift(1)
 
-    true_range = pd.concat([
+    tr = pd.concat([
         high - low,
         (high - previous).abs(),
         (low - previous).abs()
     ], axis=1).max(axis=1)
 
-    atr = float(true_range.rolling(14).mean().iloc[-1])
+    atr = float(tr.rolling(14).mean().iloc[-1])
 
     if not np.isfinite(atr) or atr <= 0:
         atr = close * 0.02
@@ -193,19 +179,16 @@ def scan(symbol):
 
     risk = max(close - stop_loss, close * 0.005)
 
-    target1 = round(close + risk * 1.5, 2)
-    target2 = round(close + risk * 2, 2)
-
     return {
         "symbol": symbol,
         "signal": "BUY WATCH",
         "close": round(close, 2),
-        "rsi": round(float(d_rsi.iloc[-1]), 2),
+        "rsi": round(float(daily_rsi.iloc[-1]), 2),
         "volume": current_volume,
         "entry": round(close, 2),
         "stop_loss": stop_loss,
-        "target1": target1,
-        "target2": target2,
+        "target1": round(close + risk * 1.5, 2),
+        "target2": round(close + risk * 2, 2),
         "risk_reward_t1": "1:1.5",
         "risk_reward_t2": "1:2"
     }
@@ -215,17 +198,25 @@ def scan_all():
 
     results = []
 
+    print("HILEGA MILEGA SCANNER STARTED")
+
     for symbol in NIFTY50:
 
         try:
+            print("Scanning:", symbol)
+
             result = scan(symbol)
 
             if result:
                 results.append(result)
+                print("SIGNAL FOUND:", symbol)
 
         except Exception as error:
-            print(
-                f"Scanner skipped {symbol}: {error}"
-            )
+            print("Scanner skipped", symbol, ":", str(error))
+
+        time.sleep(0.3)
+
+    print("SCANNER COMPLETED")
+    print("Total BUY WATCH signals:", len(results))
 
     return results
