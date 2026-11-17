@@ -73,4 +73,4 @@ def get_option_analysis(kite, underlying, spot_price):
 
     for start in range(0, len(quote_keys), 200):
         batch = quote_keys[start:start + 200]
-        quotes.update(k
+    quotes.update(kite.quote(batch))
