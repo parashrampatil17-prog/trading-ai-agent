@@ -1,7 +1,7 @@
 import os
 import requests
 from datetime import datetime
-from flask import Flask, redirect, jsonify, render_template_string
+from flask import Flask, redirect, request, jsonify, render_template_string
 from kiteconnect import KiteConnect
 
 app = Flask(__name__)
