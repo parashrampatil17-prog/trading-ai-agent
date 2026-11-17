@@ -1,39 +1,42 @@
 from datetime import date
 
-
-EXCHANGES = {
+INDEX_EXCHANGES = {
     "NIFTY": "NFO",
     "SENSEX": "BFO"
 }
 
 
-def get_option_analysis(kite, underlying, spot_price):
+def get_option_analysis(kite, underlying, spot_price, exchange=None):
 
-    if underlying not in EXCHANGES:
-        raise ValueError("Unsupported underlying")
+    underlying = str(underlying).upper().strip()
 
-    if spot_price <= 0:
-        raise ValueError("Invalid spot price")
+    if not underlying or spot_price <= 0:
+        raise ValueError("Invalid underlying or spot price")
 
-    exchange = EXCHANGES[underlying]
+    if underlying in INDEX_EXCHANGES:
+        exchange = INDEX_EXCHANGES[underlying]
+        instrument_name = underlying
+    else:
+        exchange = exchange or "NFO"
+        instrument_name = underlying
+
     instruments = kite.instruments(exchange)
     today = date.today()
 
     options = [
         item for item in instruments
-        if item["name"] == underlying
-        and item["instrument_type"] in ("CE", "PE")
+        if item.get("name") == instrument_name
+        and item.get("instrument_type") in ("CE", "PE")
+        and item.get("expiry")
         and item["expiry"] >= today
     ]
 
     if not options:
-        return {"error": "No option contracts available"}
+        return {"error": f"No active F&O contracts found for {underlying}"}
 
-    expiries = sorted(set(
+    expiry = sorted(set(
         item["expiry"] for item in options
-    ))
-
-    expiry = expiries[0]
+    ))[0]
 
     contracts = [
         item for item in options
@@ -120,6 +123,7 @@ def get_option_analysis(kite, underlying, spot_price):
         pain = 0
 
         for row in rows:
+
             strike = row["strike"]
 
             pain += (
@@ -140,11 +144,13 @@ def get_option_analysis(kite, underlying, spot_price):
     )
 
     pe_rows = [
-        x for x in rows if x["PE"].get("oi", 0) > 0
+        x for x in rows
+        if x["PE"].get("oi", 0) > 0
     ]
 
     ce_rows = [
-        x for x in rows if x["CE"].get("oi", 0) > 0
+        x for x in rows
+        if x["CE"].get("oi", 0) > 0
     ]
 
     support = (
@@ -159,13 +165,14 @@ def get_option_analysis(kite, underlying, spot_price):
 
     return {
         "underlying": underlying,
+        "exchange": exchange,
         "spot_price": spot_price,
         "expiry": expiry.isoformat(),
         "atm_strike": atm,
         "total_ce_oi": total_ce_oi,
         "total_pe_oi": total_pe_oi,
         "pcr": pcr,
-            "max_pain": max_pain,
+        "max_pain": max_pain,
         "support": support,
         "resistance": resistance,
         "option_chain": rows
