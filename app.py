@@ -412,15 +412,15 @@ def options_api(underlying):
             "error": "Invalid underlying"
         }), 400
 
-    try:
+        try:
         symbols = {
             "NIFTY": "NSE:NIFTY 50",
             "SENSEX": "BSE:SENSEX"
         }
 
         spot_data = kite.ltp(symbols[underlying])
+        spot_price = spot_data[symbols[underlying]]["last_price"]
 
-            spot_price = spot_data[symbols[underlying]]["last_price"]
         result = get_option_analysis(
             kite,
             underlying,
@@ -431,6 +431,8 @@ def options_api(underlying):
 
     except Exception as e:
         return jsonify({
+            "error": str(e)
+        }), 502
             "error": str(e)
         }), 502
 @app.route("/health")
