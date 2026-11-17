@@ -165,4 +165,8 @@ def get_option_analysis(kite, underlying, spot_price):
         "total_ce_oi": total_ce_oi,
         "total_pe_oi": total_pe_oi,
         "pcr": pcr,
-        "max_p
+            "max_pain": max_pain,
+        "support": support,
+        "resistance": resistance,
+        "option_chain": rows
+    }
