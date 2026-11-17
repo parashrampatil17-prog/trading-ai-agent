@@ -12,6 +12,7 @@ API_SECRET = os.environ.get("KITE_API_SECRET")
 
 kite = KiteConnect(api_key=API_KEY) if API_KEY else None
 ACCESS_TOKEN = None
+
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
@@ -22,22 +23,18 @@ def send_telegram(message):
 
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-
         response = requests.post(
             url,
-            data={
-                "chat_id": TG_CHAT_ID,
-                "text": message
-            },
+            data={"chat_id": TG_CHAT_ID, "text": message},
             timeout=10
         )
-
         response.raise_for_status()
         return True
-
     except Exception as e:
         print("Telegram Error:", e)
         return False
+
+
 STOCKS = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN",
     "INFY", "TCS", "LT", "AXISBANK", "BHARTIARTL",
@@ -59,23 +56,20 @@ def get_stock_data(symbol):
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=15
     )
-
     response.raise_for_status()
 
     result = response.json()["chart"]["result"][0]
     quote = result["indicators"]["quote"][0]
 
-    closes = quote["close"]
-    highs = quote["high"]
-    lows = quote["low"]
-
-    rows = [
+    return [
         (c, h, l)
-        for c, h, l in zip(closes, highs, lows)
+        for c, h, l in zip(
+            quote["close"],
+            quote["high"],
+            quote["low"]
+        )
         if c is not None and h is not None and l is not None
     ]
-
-    return rows
 
 
 # ---------------- EMA ----------------
@@ -118,7 +112,6 @@ def calculate_rsi(values, period=14):
         return 100
 
     rs = avg_gain / avg_loss
-
     return 100 - (100 / (1 + rs))
 
 
@@ -149,7 +142,6 @@ def scan_stocks():
 
             if e20 > e50 and strength > 50:
                 signal = "BULLISH WATCH"
-
             elif e20 < e50 and strength < 50:
                 signal = "BEARISH WATCH"
 
@@ -164,13 +156,13 @@ def scan_stocks():
                 "signal": signal
             })
 
-        except Exception:
+        except Exception as e:
+            print("Scanner error:", stock, e)
             continue
 
     return results
 
 
-# ---------------- DASHBOARD ----------------
 # ---------------- MARKET SUMMARY ----------------
 
 def get_market_summary():
@@ -194,6 +186,30 @@ def get_market_summary():
         "bearish": bearish,
         "neutral": neutral
     }
+
+
+# ---------------- MARKET SUMMARY API ----------------
+
+@app.route("/api/market-summary")
+def market_summary():
+    try:
+        summary = get_market_summary()
+
+        return jsonify({
+            "status": "success",
+            "market_summary": summary,
+            "updated": datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+
+# ---------------- DASHBOARD ----------------
+
 @app.route("/")
 def home():
 
@@ -209,13 +225,11 @@ def home():
     return render_template_string("""
 <!DOCTYPE html>
 <html>
-
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trading AI Dashboard</title>
 
 <style>
-
 body {
     font-family: Arial;
     background: #101827;
@@ -223,9 +237,7 @@ body {
     padding: 15px;
 }
 
-h1 {
-    color: #42d392;
-}
+h1 { color: #42d392; }
 
 .card {
     background: #243247;
@@ -239,13 +251,8 @@ h1 {
     font-weight: bold;
 }
 
-.green {
-    color: #42d392;
-}
-
-.red {
-    color: #ff6565;
-}
+.green { color: #42d392; }
+.red { color: #ff6565; }
 
 table {
     width: 100%;
@@ -259,9 +266,7 @@ td, th {
     text-align: left;
 }
 
-small {
-    color: #b7c5d8;
-}
+small { color: #b7c5d8; }
 
 button {
     padding: 12px;
@@ -277,92 +282,98 @@ select {
     border-radius: 6px;
 }
 
+.summary-number {
+    font-size: 25px;
+    font-weight: bold;
+}
 </style>
 </head>
 
 <body>
 
 <h1>🚀 Trading AI Dashboard</h1>
-
 <p class="green">Zerodha Connected</p>
 
 
 <!-- MARKET DATA -->
 
 <div class="card">
-
 <h2>NIFTY 50</h2>
-
 <div id="nifty" class="price">Loading...</div>
+</div>
 
+<div class="card">
+<h2>SENSEX</h2>
+<div id="sensex" class="price">Loading...</div>
 </div>
 
 
+<!-- MARKET SUMMARY -->
+
 <div class="card">
+<h2>📊 Unified Market Summary</h2>
 
-<h2>SENSEX</h2>
+<p>Total Stocks:
+<span id="totalStocks" class="summary-number">--</span>
+</p>
 
-<div id="sensex" class="price">Loading...</div>
+<p class="green">
+Bullish:
+<span id="bullishCount" class="summary-number">--</span>
+</p>
 
+<p class="red">
+Bearish:
+<span id="bearishCount" class="summary-number">--</span>
+</p>
+
+<p>
+Neutral:
+<span id="neutralCount" class="summary-number">--</span>
+</p>
+
+<button onclick="loadSummary()">Refresh Market Summary</button>
+<p id="summaryStatus">Waiting...</p>
 </div>
 
 
 <!-- MARKET SCANNER -->
 
 <div class="card">
-
-<h2>📊 Market Scanner</h2>
-
+<h2>📈 Market Scanner</h2>
 <p id="marketStatus">Fetching market data...</p>
-
 </div>
 
 
 <!-- OPTION CHAIN -->
 
 <div class="card">
-
 <h2>📊 Option Chain Analysis</h2>
 
 <select id="underlying">
-
 <option value="NIFTY">NIFTY</option>
-
 <option value="SENSEX">SENSEX</option>
-
 </select>
 
-<button onclick="loadOptions()">
-Analyze Option Chain
-</button>
+<button onclick="loadOptions()">Analyze Option Chain</button>
 
 <p id="optionStatus">Waiting...</p>
-
 <div id="optionResult"></div>
-
 </div>
 
 
 <!-- SWING SCANNER -->
 
 <div class="card">
-
 <h2>🔍 Swing Stock Scanner</h2>
-
 <p>EMA 20 | EMA 50 | RSI 14</p>
 
-<button onclick="scan()">
-Refresh Scanner
-</button>
-
+<button onclick="scan()">Refresh Scanner</button>
 <p id="scanStatus">Waiting...</p>
 
 <div style="overflow-x:auto">
-
 <table>
-
 <thead>
-
 <tr>
 <th>Stock</th>
 <th>Price</th>
@@ -371,48 +382,35 @@ Refresh Scanner
 <th>Resistance</th>
 <th>Signal</th>
 </tr>
-
 </thead>
-
 <tbody id="scanner"></tbody>
-
 </table>
-
 </div>
-
 </div>
 
 
 <!-- RISK MANAGEMENT -->
 
 <div class="card">
-
 <h3>⚠️ Risk Management</h3>
-
 <p>Signals are for research only.</p>
-
 <p>No automatic orders are placed.</p>
-
+<p>Market Summary and Swing Scanner use daily candles.</p>
 </div>
 
 <p><small>Market refresh: 20 seconds</small></p>
-
 <p id="updated"></p>
 
 
 <script>
 
-
 // ---------------- MARKET UPDATE ----------------
 
 async function updateMarket() {
-
     const status = document.getElementById("marketStatus");
 
     try {
-
         const response = await fetch("/api/market");
-
         const data = await response.json();
 
         if (!response.ok) {
@@ -420,15 +418,12 @@ async function updateMarket() {
         }
 
         for (const name of ["NIFTY 50", "SENSEX"]) {
-
             const item = data[name];
-
             const id = name === "NIFTY 50" ? "nifty" : "sensex";
 
             if (!item) continue;
 
             const change = item.price - item.close;
-
             const percent = item.close
                 ? change / item.close * 100
                 : 0;
@@ -437,10 +432,7 @@ async function updateMarket() {
                 item.price.toLocaleString("en-IN") +
                 "<br><small>" +
                 change.toFixed(2) +
-                " (" +
-                percent.toFixed(2) +
-                "%)</small>";
-
+                " (" + percent.toFixed(2) + "%)</small>";
         }
 
         status.innerText = "Market data updated successfully";
@@ -448,31 +440,60 @@ async function updateMarket() {
         document.getElementById("updated").innerText =
             "Last updated: " + new Date().toLocaleTimeString();
 
-    }
-
-    catch (error) {
-
+    } catch (error) {
         status.innerText = error.message || "Market data unavailable";
-
     }
+}
 
+
+// ---------------- MARKET SUMMARY ----------------
+
+async function loadSummary() {
+    const status = document.getElementById("summaryStatus");
+
+    status.innerText = "Analyzing market...";
+
+    try {
+        const response = await fetch("/api/market-summary");
+        const data = await response.json();
+
+        if (!response.ok || data.status !== "success") {
+            throw new Error(data.error || "Summary API Error");
+        }
+
+        const summary = data.market_summary;
+
+        document.getElementById("totalStocks").innerText =
+            summary.total_stocks;
+
+        document.getElementById("bullishCount").innerText =
+            summary.bullish;
+
+        document.getElementById("bearishCount").innerText =
+            summary.bearish;
+
+        document.getElementById("neutralCount").innerText =
+            summary.neutral;
+
+        status.innerText =
+            "Updated: " + new Date(data.updated).toLocaleString();
+
+    } catch (error) {
+        status.innerText = "Error: " + error.message;
+    }
 }
 
 
 // ---------------- SWING SCANNER ----------------
 
 async function scan() {
-
     const status = document.getElementById("scanStatus");
-
     const tbody = document.getElementById("scanner");
 
     status.innerText = "Scanning stocks...";
 
     try {
-
         const response = await fetch("/api/scanner");
-
         const data = await response.json();
 
         if (!response.ok) {
@@ -482,7 +503,6 @@ async function scan() {
         tbody.innerHTML = "";
 
         data.results.forEach(stock => {
-
             const color =
                 stock.signal === "BULLISH WATCH"
                 ? "green"
@@ -492,43 +512,28 @@ async function scan() {
 
             tbody.innerHTML += `
             <tr>
-
                 <td>${stock.stock}</td>
-
                 <td>${stock.price}</td>
-
                 <td>${stock.rsi}</td>
-
                 <td>${stock.support}</td>
-
                 <td>${stock.resistance}</td>
-
                 <td class="${color}">${stock.signal}</td>
-
-            </tr>
-            `;
-
+            </tr>`;
         });
 
         status.innerText =
             "Scanner completed. Stocks found: " +
             data.results.length;
 
-    }
-
-    catch (error) {
-
+    } catch (error) {
         status.innerText = error.message;
-
     }
-
 }
 
 
 // ---------------- OPTION CHAIN ----------------
 
 async function loadOptions() {
-
     const underlying =
         document.getElementById("underlying").value;
 
@@ -539,50 +544,32 @@ async function loadOptions() {
         document.getElementById("optionResult");
 
     status.innerText = "Loading Option Chain...";
-
     resultDiv.innerHTML = "";
 
     try {
-
-        const response = await fetch(
-            "/api/options/" + underlying
-        );
-
+        const response = await fetch("/api/options/" + underlying);
         const data = await response.json();
 
         if (!response.ok || data.error) {
-
             throw new Error(data.error || "API Error");
-
         }
 
         status.innerText =
             underlying + " | Expiry: " + data.expiry;
 
         resultDiv.innerHTML = `
-
             <h3>Spot: ${data.spot_price}</h3>
-
             <h3>ATM: ${data.atm_strike}</h3>
-
             <p>PCR: ${data.pcr}</p>
-
             <p>Max Pain: ${data.max_pain}</p>
-
             <p>Support: ${data.support}</p>
-
             <p>Resistance: ${data.resistance}</p>
-
             <p>Total CE OI: ${data.total_ce_oi}</p>
-
             <p>Total PE OI: ${data.total_pe_oi}</p>
 
             <div style="overflow-x:auto">
-
             <table>
-
                 <thead>
-
                     <tr>
                         <th>CE OI</th>
                         <th>CE LTP</th>
@@ -590,56 +577,35 @@ async function loadOptions() {
                         <th>PE LTP</th>
                         <th>PE OI</th>
                     </tr>
-
                 </thead>
-
                 <tbody>
-
                     ${data.option_chain.map(row => `
-
                         <tr>
-
                             <td>${row.CE?.oi ?? "-"}</td>
-
                             <td>${row.CE?.ltp ?? "-"}</td>
-
                             <td><b>${row.strike}</b></td>
-
                             <td>${row.PE?.ltp ?? "-"}</td>
-
                             <td>${row.PE?.oi ?? "-"}</td>
-
                         </tr>
-
                     `).join("")}
-
                 </tbody>
-
             </table>
-
             </div>
-
         `;
 
-    }
-
-    catch (error) {
-
+    } catch (error) {
         status.innerText = "Error: " + error.message;
-
     }
-
 }
 
 
 // ---------------- AUTO START ----------------
 
 updateMarket();
-
 scan();
+loadSummary();
 
 setInterval(updateMarket, 20000);
-
 
 </script>
 
@@ -652,7 +618,6 @@ setInterval(updateMarket, 20000);
 
 @app.route("/login")
 def login():
-
     if not kite:
         return "KITE_API_KEY missing", 500
 
@@ -661,7 +626,6 @@ def login():
 
 @app.route("/kite/callback")
 def callback():
-
     global ACCESS_TOKEN
 
     request_token = request.args.get("request_token")
@@ -670,20 +634,18 @@ def callback():
         return "Login failed. Check credentials."
 
     try:
-
         data = kite.generate_session(
             request_token,
             api_secret=API_SECRET
         )
 
         ACCESS_TOKEN = data["access_token"]
-
         kite.set_access_token(ACCESS_TOKEN)
 
         return redirect("/")
 
-    except Exception:
-
+    except Exception as e:
+        print("Authentication error:", e)
         return "Authentication failed. Please login again."
 
 
@@ -691,14 +653,12 @@ def callback():
 
 @app.route("/api/market")
 def market():
-
     if not ACCESS_TOKEN:
         return jsonify({
             "error": "Please login with Zerodha"
         }), 401
 
     try:
-
         quotes = kite.ohlc([
             "NSE:NIFTY 50",
             "BSE:SENSEX"
@@ -710,9 +670,7 @@ def market():
             ("NSE:NIFTY 50", "NIFTY 50"),
             ("BSE:SENSEX", "SENSEX")
         ]:
-
             if name in quotes:
-
                 item = quotes[name]
 
                 result[label] = {
@@ -722,8 +680,8 @@ def market():
 
         return jsonify(result)
 
-    except Exception:
-
+    except Exception as e:
+        print("Market API error:", e)
         return jsonify({
             "error": "Market data unavailable. Check Zerodha login."
         }), 502
@@ -733,9 +691,7 @@ def market():
 
 @app.route("/api/scanner")
 def scanner():
-
     try:
-
         results = scan_stocks()
 
         return jsonify({
@@ -743,10 +699,9 @@ def scanner():
             "updated": datetime.now().isoformat()
         })
 
-    except Exception:
-
+    except Exception as e:
         return jsonify({
-            "error": "Scanner unavailable"
+            "error": str(e)
         }), 502
 
 
@@ -754,7 +709,6 @@ def scanner():
 
 @app.route("/api/options/<underlying>")
 def options_api(underlying):
-
     if not ACCESS_TOKEN:
         return jsonify({
             "error": "Please login with Zerodha"
@@ -766,14 +720,12 @@ def options_api(underlying):
         }), 400
 
     try:
-
         symbols = {
             "NIFTY": "NSE:NIFTY 50",
             "SENSEX": "BSE:SENSEX"
         }
 
         spot_data = kite.ltp(symbols[underlying])
-
         spot_price = spot_data[
             symbols[underlying]
         ]["last_price"]
@@ -787,38 +739,50 @@ def options_api(underlying):
         return jsonify(result)
 
     except Exception as e:
-
         return jsonify({
             "error": str(e)
         }), 502
 
 
-# ---------------- HEALTH CHECK ----------------
+# ---------------- TELEGRAM TEST ----------------
+
 @app.route("/test-telegram")
 def test_telegram():
-
     if not ACCESS_TOKEN:
         return "Please login with Zerodha first", 401
 
     success = send_telegram(
-        "✅ Trading AI Dashboard: Telegram connection successful!"
+        "Trading AI Dashboard: Telegram connection successful!"
     )
 
     if success:
         return "Telegram Test Alert Sent Successfully!"
 
     return "Telegram Alert Failed. Check Render Environment Variables.", 500
+
+
+# ---------------- HEALTH CHECK ----------------
+
 @app.route("/health")
 def health():
-
     return "Trading AI Agent Running"
 
 
 # ---------------- APP START ----------------
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
     )
+
+आता काय करायचे?
+
+1. GitHub मधील "app.py" उघडा.
+2. जुना पूर्ण कोड Select All करून काढा.
+3. वरील पूर्ण कोड पेस्ट करा.
+4. Commit करण्यापूर्वी मला सांगा.
+
+लक्षात ठेवा: हा Market Summary 15 Stocks च्या Daily Data वर आधारित आहे. BUY/SELL ऑर्डर देत नाही. Zerodha Access Token Render restart झाल्यावर पुन्हा Login करावा लागू शकतो.
+
+पेस्ट करताना अडचण आली तर स्क्रीनशॉट पाठवा.
