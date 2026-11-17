@@ -206,7 +206,20 @@ button {
 <h2>📊 Market Scanner</h2>
 <p id="marketStatus">Fetching market data...</p>
 </div>
+<div class="card">
+    <h2>📊 Option Chain Analysis</h2>
 
+    <select id="underlying">
+        <option value="NIFTY">NIFTY</option>
+        <option value="SENSEX">SENSEX</option>
+    </select>
+
+    <button onclick="loadOptions()">Analyze Option Chain</button>
+
+    <div id="optionStatus">Waiting...</div>
+
+    <div id="optionResult"></div>
+</div>
 <div class="card">
 <h2>🔍 Swing Stock Scanner</h2>
 <p>EMA 20 | EMA 50 | RSI 14</p>
