@@ -332,21 +332,12 @@ async function runAISignal(){
         <h2>${data.signal||"WAIT"}</h2>
         <p>Spot: ${data.spot??"-"} | Expiry: ${data.expiry??"-"} |
         ATM: ${data.atm_strike??"-"}</p>
-        <p>Option: ${data.option_symbol??"-"} |
-        LTP snapshot: ${data.option_ltp??"-"}</p>
-        <hr>
-        <h3>5-Minute Entry Indicators</h3>
+        <p>ATM CE: ${data.atm_ce_symbol??"-"} | CE LTP: ${data.atm_ce_ltp??"-"}</p>
+        <p>ATM PE: ${data.atm_pe_symbol??"-"} | PE LTP: ${data.atm_pe_ltp??"-"}</p>
+        <p>Signal option: ${data.option_symbol??"-"} | LTP snapshot: ${data.option_ltp??"-"}</p>
         <p>RSI 14: ${data.rsi14??"-"} | EMA 9: ${data.ema9??"-"} |
-        EMA 21: ${data.ema21??"-"} | Bias: ${data.bias_5m??"-"}</p>
-        <p>Last 5m candle: ${data.last_candle_5m??"-"} |
-        Candles: ${data.candles_count_5m??"-"}</p>
-        <h3>15-Minute Trend Confirmation</h3>
-        <p>RSI 14: ${data.rsi14_15m??"-"} | EMA 9: ${data.ema9_15m??"-"} |
-        EMA 21: ${data.ema21_15m??"-"} | Bias: ${data.bias_15m??"-"}</p>
-        <p>Last 15m candle: ${data.last_candle_15m??"-"} |
-        Candles: ${data.candles_count_15m??"-"}</p>
-        <p>Analysis updated: ${data.analysis_updated_at??"-"}</p>
-        <p>PCR: ${data.pcr??"-"} | Combined technical: ${data.technical_bias??"-"} |
+        EMA 21: ${data.ema21??"-"}</p>
+        <p>PCR: ${data.pcr??"-"} | Technical: ${data.technical_bias??"-"} |
         OI: ${data.oi_bias??"-"}</p>
         <p>Support: ${data.support??"-"} | Resistance: ${data.resistance??"-"} |
         Hilega: ${data.hilega_confirmation??"-"}</p>
