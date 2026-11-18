@@ -342,6 +342,14 @@ async function runAISignal(){
         Hilega: ${data.hilega_confirmation??"-"}</p>
         <p>Bull score: ${data.bull_score??"-"} |
         Bear score: ${data.bear_score??"-"}</p>
+        <hr>
+        <h3>Paper Trade Plan (illustrative only)</h3>
+        <p>Confidence score: ${data.confidence_score??"-"}/100</p>
+        <p>Entry zone: ${data.entry_zone_low??"-"} to ${data.entry_zone_high??"-"}</p>
+        <p>Stop Loss: ${data.stop_loss??"-"}</p>
+        <p>Target 1: ${data.target1??"-"} | R:R: ${data.risk_reward_t1??"-"}</p>
+        <p>Target 2: ${data.target2??"-"} | R:R: ${data.risk_reward_t2??"-"}</p>
+        <p>${data.plan_note||"Entry, SL and targets are illustrative estimates, not validated trading levels."}</p>
         <p>${data.note||data.reason||""}</p>`;
     }catch(error){status.innerText="Error: "+error.message;}
 }
