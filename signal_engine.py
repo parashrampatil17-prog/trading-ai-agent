@@ -1,8 +1,7 @@
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from statistics import mean
 
-# Illustrative paper-test assumptions; not validated trading parameters.
+# Paper-mode assumptions only; not validated trading parameters.
 PAPER_STOP_LOSS_PCT = 0.20
 PAPER_TARGET1_PCT = 0.25
 PAPER_TARGET2_PCT = 0.50
@@ -52,52 +51,12 @@ def _instrument_token(kite, underlying):
     return item["instrument_token"]
 
 
-def _indicators(candles):
-    closes = [float(x["close"]) for x in candles if x.get("close") is not None]
-    if len(closes) < 30:
-        return None
-    e9, e21, rsi = _ema(closes, 9), _ema(closes, 21), _rsi(closes, 14)
-    if e9 is None or e21 is None or rsi is None:
-        return None
-    last = closes[-1]
-    bias = (
-        "BULLISH" if last > e9 > e21 and rsi >= 55
-        else "BEARISH" if last < e9 < e21 and rsi <= 45
-        else "MIXED"
-    )
-    last_candle = candles[-1].get("date")
-    return {
-        "close": round(last, 2),
-        "ema9": round(e9, 2),
-        "ema21": round(e21, 2),
-        "rsi14": round(rsi, 2),
-        "bias": bias,
-        "last_candle": last_candle.isoformat() if hasattr(last_candle, "isoformat") else str(last_candle),
-        "candles_count": len(closes)
-    }
-
-
-
-def _completed_candles(candles, interval_minutes, now):
-    """Keep only candles whose full interval has ended (IST-aware)."""
-    completed = []
-    for candle in candles:
-        stamp = candle.get("date")
-        if stamp is None:
-            continue
-        if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
-        else:
-            stamp = stamp.astimezone(ZoneInfo("Asia/Kolkata"))
-        if stamp + timedelta(minutes=interval_minutes) <= now:
-            completed.append(candle)
-    return completed
-
 def _paper_option_plan(option_ltp):
-    keys = ("entry_zone_low", "entry_zone_high", "stop_loss",
-            "target1", "target2", "risk_reward_t1", "risk_reward_t2")
     if option_ltp is None or float(option_ltp) <= 0:
-        return {key: None for key in keys}
+        return {key: None for key in (
+            "entry_zone_low", "entry_zone_high", "stop_loss",
+            "target1", "target2", "risk_reward_t1", "risk_reward_t2"
+        )}
     premium = float(option_ltp)
     entry_low = premium
     entry_high = premium * (1 + PAPER_ENTRY_BUFFER_PCT)
@@ -120,138 +79,71 @@ def _paper_option_plan(option_ltp):
 def build_signal(kite, underlying, spot, chain, hilega_result=None):
     underlying = str(underlying).upper().strip()
     token = _instrument_token(kite, underlying)
-    now = datetime.now(ZoneInfo('Asia/Kolkata'))
+    now = datetime.now()
+    candles = kite.historical_data(token, now - timedelta(days=12), now, "15minute")
+    closes = [float(x["close"]) for x in candles if x.get("close") is not None]
+    if len(closes) < 30:
+        return {"signal": "WAIT", "reason": "Not enough 15-minute candles for confirmation.",
+                "underlying": underlying, "confidence_score": 0,
+                "confidence_label": "Insufficient data"}
 
-    candles_5m = kite.historical_data(
-        token, now - timedelta(days=5), now, "5minute"
-    )
-    candles_15m = kite.historical_data(
-        token, now - timedelta(days=12), now, "15minute"
-    )
+    ema9, ema21, rsi14 = _ema(closes, 9), _ema(closes, 21), _rsi(closes, 14)
+    if ema9 is None or ema21 is None or rsi14 is None:
+        return {"signal": "WAIT", "reason": "Indicator data unavailable.",
+                "underlying": underlying, "confidence_score": 0,
+                "confidence_label": "Insufficient data"}
 
-    # Remove the currently forming candle; use only fully closed candles.
-    candles_5m = _completed_candles(candles_5m, 5, now)
-    candles_15m = _completed_candles(candles_15m, 15, now)
-
-    ind5 = _indicators(candles_5m)
-    ind15 = _indicators(candles_15m)
-
-    if not ind5 or not ind15:
-        return {
-            "underlying": underlying, "signal": "WAIT",
-            "reason": "Not enough completed 5-minute or 15-minute candles.",
-            "confidence_score": 0,
-            "confidence_label": "Insufficient data",
-            "timeframe_5m": ind5, "timeframe_15m": ind15
-        }
-
-    market_open = now.weekday() < 5 and (
-        (now.hour > 9 or (now.hour == 9 and now.minute >= 15))
-        and (now.hour < 15 or (now.hour == 15 and now.minute <= 30))
-    )
-    latest5 = candles_5m[-1].get("date")
-    latest15 = candles_15m[-1].get("date")
-    if market_open and (
-        latest5 is None or latest15 is None
-        or latest5.date() != now.date()
-        or latest15.date() != now.date()
-    ):
-        return {
-            "underlying": underlying,
-            "signal": "WAIT",
-            "reason": "Stale candle data: today's completed 5m and 15m candles are not both available. No trade signal generated.",
-            "confidence_score": 0,
-            "confidence_label": "Stale market data",
-            "timeframe_5m": ind5,
-            "timeframe_15m": ind15,
-            "last_candle_5m": ind5.get("last_candle"),
-            "last_candle_15m": ind15.get("last_candle"),
-            "analysis_updated_at": now.isoformat(timespec="seconds")
-        }
-
-    # 5-minute chart is the entry trigger; 15-minute chart confirms trend.
-    technical = (
-        "BULLISH" if ind5["bias"] == "BULLISH" and ind15["bias"] == "BULLISH"
-        else "BEARISH" if ind5["bias"] == "BEARISH" and ind15["bias"] == "BEARISH"
-        else "MIXED"
-    )
     pcr = float(chain.get("pcr") or 0)
-    oi_bias = (
-        "BULLISH" if pcr >= 1.10
-        else "BEARISH" if 0 < pcr <= 0.85
-        else "MIXED"
-    )
+    strong_bull_technical = spot > ema9 > ema21 and rsi14 >= 55
+    strong_bear_technical = spot < ema9 < ema21 and rsi14 <= 45
+    technical = ("BULLISH" if strong_bull_technical else
+                 "BEARISH" if strong_bear_technical else "MIXED")
+    oi_bias = ("BULLISH" if pcr >= 1.10 else
+               "BEARISH" if 0 < pcr <= 0.85 else "MIXED")
     hilega_ok = bool(hilega_result and hilega_result.get("signal") == "BUY WATCH")
-    bull = (2 if technical == "BULLISH" else 0) + (1 if oi_bias == "BULLISH" else 0) + (1 if hilega_ok else 0)
-    bear = (2 if technical == "BEARISH" else 0) + (1 if oi_bias == "BEARISH" else 0)
 
-    signal = (
-        "CE WATCH" if bull >= 3 and technical == "BULLISH"
-        else "PE WATCH" if bear >= 3 and technical == "BEARISH"
-        else "NO TRADE"
-    )
-    confidence = (
-        round(bull / 4 * 100) if signal == "CE WATCH"
-        else round(bear / 4 * 100) if signal == "PE WATCH"
-        else 0
-    )
+    bull = (2 if strong_bull_technical else 0) + (1 if oi_bias == "BULLISH" else 0) + (1 if hilega_ok else 0)
+    bear = (2 if strong_bear_technical else 0) + (1 if oi_bias == "BEARISH" else 0)
+
+    if bull >= 3 and strong_bull_technical:
+        signal, option_type, confidence = "STRONG CE WATCH", "CE", round(bull / 4 * 100)
+    elif bear >= 3 and strong_bear_technical:
+        signal, option_type, confidence = "STRONG PE WATCH", "PE", round(bear / 4 * 100)
+    else:
+        early_bull = spot > ema9 > ema21 and rsi14 >= 50 and pcr >= 0.95
+        early_bear = spot < ema9 < ema21 and rsi14 <= 50 and 0 < pcr <= 1.05
+        if early_bull:
+            signal, option_type, confidence = "EARLY CE WATCH", "CE", 50
+        elif early_bear:
+            signal, option_type, confidence = "EARLY PE WATCH", "PE", 50
+        else:
+            signal, option_type, confidence = "NO TRADE", None, 0
 
     atm = chain.get("atm_strike")
     atm_row = next((x for x in chain.get("option_chain", [])
                     if atm is not None and float(x.get("strike", -1)) == float(atm)), {})
-    # Always expose both ATM premiums for monitoring, even when signal is NO TRADE.
-    atm_ce = atm_row.get("CE", {}) or {}
-    atm_pe = atm_row.get("PE", {}) or {}
-
-    option_type = "CE" if signal == "CE WATCH" else "PE"
-    contract = atm_ce if option_type == "CE" else atm_pe
-    contract = contract if signal in ("CE WATCH", "PE WATCH") else {}
+    contract = atm_row.get(option_type, {}) if option_type else {}
     option_ltp = contract.get("ltp")
     plan = _paper_option_plan(option_ltp) if contract else _paper_option_plan(None)
 
     return {
         "underlying": underlying, "signal": signal,
         "spot": round(float(spot), 2), "expiry": chain.get("expiry"),
-        "atm_strike": atm,
-        "atm_ce_symbol": atm_ce.get("symbol"),
-        "atm_ce_ltp": atm_ce.get("ltp"),
-        "atm_pe_symbol": atm_pe.get("symbol"),
-        "atm_pe_ltp": atm_pe.get("ltp"),
-        "option_symbol": contract.get("symbol"),
-        "option_ltp": option_ltp, "option_type": option_type if contract else None,
+        "atm_strike": atm, "option_symbol": contract.get("symbol"),
+        "option_ltp": option_ltp, "option_type": option_type,
         "pcr": pcr, "technical_bias": technical, "oi_bias": oi_bias,
-        "rsi14": round(ind5["rsi14"], 2),
-        "ema9": round(ind5["ema9"], 2),
-        "ema21": round(ind5["ema21"], 2),
-        "rsi14_15m": round(ind15["rsi14"], 2),
-        "ema9_15m": round(ind15["ema9"], 2),
-        "ema21_15m": round(ind15["ema21"], 2),
-        "bias_5m": ind5["bias"], "bias_15m": ind15["bias"],
-        "last_candle_5m": ind5["last_candle"],
-        "last_candle_15m": ind15["last_candle"],
-        "candles_count_5m": ind5["candles_count"],
-        "candles_count_15m": ind15["candles_count"],
-        "analysis_updated_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(timespec="seconds"),
-        "timeframe_rule": "5-minute entry + 15-minute trend confirmation; completed candles only",
-        "candle_status": "COMPLETED CANDLES ONLY",
-        "option_data_status": "ATM CE and PE LTP snapshots from option chain; verify live quote before any decision",
-        "support": chain.get("support"), "resistance": chain.get("resistance"),
-        "hilega_confirmation": (
-            "YES" if hilega_ok else
-            "NOT APPLICABLE" if underlying in ("NIFTY", "SENSEX") else "NO"
-        ),
+        "rsi14": round(rsi14, 2), "ema9": round(ema9, 2),
+        "ema21": round(ema21, 2), "support": chain.get("support"),
+        "resistance": chain.get("resistance"),
+        "hilega_confirmation": ("YES" if hilega_ok else
+            "NOT APPLICABLE" if underlying in ("NIFTY", "SENSEX") else "NO"),
         "bull_score": bull, "bear_score": bear,
         "confidence_score": confidence,
         "confidence_label": "Rule-based confirmation score, not win probability",
         **plan,
-        "plan_note": (
-            "Illustrative paper plan based on the option LTP snapshot; "
-            "entry band +2%, stop -20%, targets +25% and +50%. "
-            "These assumptions are not validated."
-        ),
-        "note": (
-            "Paper mode only. 5m is the entry trigger and 15m confirms trend. "
-            "Verify candle freshness, live option price, spread and liquidity. "
-            "No order is placed."
-        )
+        "plan_note": ("Illustrative paper plan from current option LTP snapshot: "
+            "entry band up to 2% above snapshot, stop 20% below reference entry, "
+            "targets 25% and 50% above reference entry. Not validated."),
+        "note": ("Research/paper mode only. EARLY WATCH is preliminary, not a confirmed entry. "
+            "Verify live price, spread, liquidity and chart. No order is placed.")
     }
