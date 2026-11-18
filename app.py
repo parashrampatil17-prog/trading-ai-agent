@@ -1,12 +1,15 @@
 import os
+import gc
 import requests
 from datetime import datetime
 from flask import Flask, redirect, request, jsonify, render_template_string
 from kiteconnect import KiteConnect
 from options_engine import get_option_analysis
-from hilega_milega_scanner import scan_all as scan_hilega_all
+from hilega_milega_scanner import NIFTY50, scan as scan_hilega_stock
+from signal_engine import build_signal
 
 app = Flask(__name__)
+
 API_KEY = os.environ.get("KITE_API_KEY")
 API_SECRET = os.environ.get("KITE_API_SECRET")
 kite = KiteConnect(api_key=API_KEY) if API_KEY else None
@@ -15,187 +18,425 @@ TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
 STOCKS = [
-    "RELIANCE","HDFCBANK","ICICIBANK","SBIN","INFY","TCS","LT",
-    "AXISBANK","BHARTIARTL","ITC","TATAMOTORS","MARUTI","SUNPHARMA",
-    "NTPC","POWERGRID"
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY", "TCS", "LT",
+    "AXISBANK", "BHARTIARTL", "ITC", "TATAMOTORS", "MARUTI", "SUNPHARMA",
+    "NTPC", "POWERGRID"
 ]
+
 
 def send_telegram(message):
     if not TG_TOKEN or not TG_CHAT_ID:
         return False
     try:
-        r = requests.post(
+        response = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": TG_CHAT_ID, "text": message}, timeout=10
+            data={"chat_id": TG_CHAT_ID, "text": message},
+            timeout=10
         )
-        r.raise_for_status()
+        response.raise_for_status()
         return True
     except Exception as exc:
-        print("Telegram Error:", exc)
+        print("Telegram Error:", repr(exc))
         return False
 
+
 def get_stock_data(symbol):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS?range=3mo&interval=1d"
-    r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
-    r.raise_for_status()
-    results = r.json()["chart"]["result"]
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{symbol}.NS?range=3mo&interval=1d"
+    )
+    response = requests.get(
+        url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+    )
+    response.raise_for_status()
+    results = response.json()["chart"]["result"]
     if not results:
         raise ValueError("No Yahoo Finance data")
-    q = results[0]["indicators"]["quote"][0]
-    return [(c,h,l) for c,h,l in zip(q["close"],q["high"],q["low"])
-            if c is not None and h is not None and l is not None]
+    quote = results[0]["indicators"]["quote"][0]
+    return [
+        (close, high, low)
+        for close, high, low in zip(
+            quote["close"], quote["high"], quote["low"]
+        )
+        if close is not None and high is not None and low is not None
+    ]
+
 
 def ema(values, period):
     if len(values) < period:
         return None
-    mult = 2/(period+1)
-    value = sum(values[:period])/period
-    for x in values[period:]:
-        value = (x-value)*mult+value
+    multiplier = 2 / (period + 1)
+    value = sum(values[:period]) / period
+    for price in values[period:]:
+        value = (price - value) * multiplier + value
     return value
+
 
 def calculate_rsi(values, period=14):
     if len(values) <= period:
         return None
-    changes=[values[i]-values[i-1] for i in range(1,len(values))]
-    gains=[max(x,0) for x in changes]
-    losses=[max(-x,0) for x in changes]
-    ag=sum(gains[:period])/period
-    al=sum(losses[:period])/period
-    for g,l in zip(gains[period:],losses[period:]):
-        ag=(ag*(period-1)+g)/period
-        al=(al*(period-1)+l)/period
-    if al == 0:
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gains = [max(change, 0) for change in changes]
+    losses = [max(-change, 0) for change in changes]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    if avg_loss == 0:
         return 100
-    rs=ag/al
-    return 100-100/(1+rs)
+    relative_strength = avg_gain / avg_loss
+    return 100 - 100 / (1 + relative_strength)
+
 
 def scan_stocks():
-    results=[]
+    results = []
     for stock in STOCKS:
         try:
-            rows=get_stock_data(stock)
-            if len(rows)<50:
+            rows = get_stock_data(stock)
+            if len(rows) < 50:
                 continue
-            closes=[x[0] for x in rows]
-            highs=[x[1] for x in rows]
-            lows=[x[2] for x in rows]
-            e20,e50=ema(closes,20),ema(closes,50)
-            strength=calculate_rsi(closes)
-            if e20 is None or e50 is None or strength is None:
+            closes = [row[0] for row in rows]
+            highs = [row[1] for row in rows]
+            lows = [row[2] for row in rows]
+            ema20 = ema(closes, 20)
+            ema50 = ema(closes, 50)
+            strength = calculate_rsi(closes)
+            if ema20 is None or ema50 is None or strength is None:
                 continue
-            signal="NEUTRAL"
-            if e20>e50 and strength>50:
-                signal="BULLISH WATCH"
-            elif e20<e50 and strength<50:
-                signal="BEARISH WATCH"
+
+            signal = "NEUTRAL"
+            if ema20 > ema50 and strength > 50:
+                signal = "BULLISH WATCH"
+            elif ema20 < ema50 and strength < 50:
+                signal = "BEARISH WATCH"
+
             results.append({
-                "stock":stock,"price":round(closes[-1],2),
-                "ema20":round(e20,2),"ema50":round(e50,2),
-                "rsi":round(strength,2),"support":round(min(lows[-20:]),2),
-                "resistance":round(max(highs[-20:]),2),"signal":signal
+                "stock": stock,
+                "price": round(closes[-1], 2),
+                "ema20": round(ema20, 2),
+                "ema50": round(ema50, 2),
+                "rsi": round(strength, 2),
+                "support": round(min(lows[-20:]), 2),
+                "resistance": round(max(highs[-20:]), 2),
+                "signal": signal
             })
         except Exception as exc:
-            print("Scanner error:",stock,exc)
+            print("Scanner error:", stock, repr(exc))
     return results
 
+
 def market_summary_data():
-    rows=scan_stocks()
-    bull=sum(x["signal"]=="BULLISH WATCH" for x in rows)
-    bear=sum(x["signal"]=="BEARISH WATCH" for x in rows)
-    return {"total_stocks":len(rows),"bullish":bull,"bearish":bear,
-            "neutral":len(rows)-bull-bear}
+    rows = scan_stocks()
+    bullish = sum(row["signal"] == "BULLISH WATCH" for row in rows)
+    bearish = sum(row["signal"] == "BEARISH WATCH" for row in rows)
+    return {
+        "total_stocks": len(rows),
+        "bullish": bullish,
+        "bearish": bearish,
+        "neutral": len(rows) - bullish - bearish
+    }
+
 
 def logged_in():
     return bool(kite and ACCESS_TOKEN)
+
 
 @app.route("/")
 def home():
     if not kite:
         return "KITE_API_KEY missing. Check Render Environment Variables."
     if not ACCESS_TOKEN:
-        return '<h2>Trading AI Dashboard</h2><a href="/login">Login with Zerodha</a>'
+        return (
+            '<h2>Trading AI Dashboard</h2>'
+            '<a href="/login">Login with Zerodha</a>'
+        )
+
     return render_template_string(r"""
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Trading AI Dashboard</title><style>
-body{font-family:Arial;background:#101827;color:white;padding:15px}h1{color:#42d392}
-.card{background:#243247;padding:18px;margin:12px 0;border-radius:12px}
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading AI Dashboard</title>
+<style>
+body{font-family:Arial;background:#101827;color:white;padding:15px}
+h1{color:#42d392}.card{background:#243247;padding:18px;margin:12px 0;border-radius:12px}
 .price{font-size:27px;font-weight:bold}.green{color:#42d392}.red{color:#ff6565}
-table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:9px 5px;border-bottom:1px solid #45546b;text-align:left}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:9px 5px;border-bottom:1px solid #45546b;text-align:left}
 small{color:#b7c5d8}button{padding:12px;background:#42d392;border:0;border-radius:8px;font-weight:bold;margin:5px 0}
-select,input{padding:10px;border-radius:6px;max-width:100%}.summary-number{font-size:25px;font-weight:bold}
-</style></head><body>
-<h1>🚀 Trading AI Dashboard</h1><p class="green">Zerodha Connected</p>
+select,input{padding:10px;border-radius:6px;max-width:100%}
+.summary-number{font-size:25px;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>🚀 Trading AI Dashboard</h1>
+<p class="green">Zerodha Connected</p>
+
 <div class="card"><h2>NIFTY 50</h2><div id="nifty" class="price">Loading...</div></div>
 <div class="card"><h2>SENSEX</h2><div id="sensex" class="price">Loading...</div></div>
-<div class="card"><h2>📊 Unified Market Summary</h2>
+
+<div class="card">
+<h2>📊 Unified Market Summary</h2>
 <p>Total Stocks: <span id="totalStocks" class="summary-number">--</span></p>
 <p class="green">Bullish: <span id="bullishCount" class="summary-number">--</span></p>
 <p class="red">Bearish: <span id="bearishCount" class="summary-number">--</span></p>
 <p>Neutral: <span id="neutralCount" class="summary-number">--</span></p>
-<button onclick="loadSummary()">Refresh Market Summary</button><p id="summaryStatus">Waiting...</p></div>
+<button onclick="loadSummary()">Refresh Market Summary</button>
+<p id="summaryStatus">Waiting...</p>
+</div>
+
 <div class="card"><h2>📈 Market Scanner</h2><p id="marketStatus">Fetching market data...</p></div>
-<div class="card"><h2>📊 Index Option Chain</h2>
+
+<div class="card">
+<h2>🎯 CE / PE Signal Engine — Paper Mode</h2>
+<p>Technical trend + RSI + EMA + Option Chain PCR + Hilega Milega confirmation.</p>
+<select id="signalUnderlying">
+<option value="NIFTY">NIFTY</option>
+<option value="SENSEX">SENSEX</option>
+<option value="RELIANCE">RELIANCE</option>
+<option value="HDFCBANK">HDFCBANK</option>
+<option value="ICICIBANK">ICICIBANK</option>
+<option value="SBIN">SBIN</option>
+<option value="INFY">INFY</option>
+<option value="TCS">TCS</option>
+<option value="LT">LT</option>
+<option value="AXISBANK">AXISBANK</option>
+<option value="BHARTIARTL">BHARTIARTL</option>
+<option value="ITC">ITC</option>
+<option value="TATAMOTORS">TATAMOTORS</option>
+<option value="MARUTI">MARUTI</option>
+<option value="SUNPHARMA">SUNPHARMA</option>
+<option value="NTPC">NTPC</option>
+<option value="POWERGRID">POWERGRID</option>
+</select>
+<button onclick="runAISignal()">Generate CE / PE Signal</button>
+<p id="aiSignalStatus">Waiting...</p>
+<div id="aiSignalResult"></div>
+<p><small>Research / paper mode only. WATCH is not a buy recommendation. No orders are placed.</small></p>
+</div>
+
+<div class="card">
+<h2>📊 Index Option Chain</h2>
 <select id="underlying"><option>NIFTY</option><option>SENSEX</option></select>
-<button onclick="loadOptions()">Analyze Option Chain</button><p id="optionStatus">Waiting...</p><div id="optionResult"></div></div>
-<div class="card"><h2>🔍 Swing Stock Scanner</h2><p>EMA 20 | EMA 50 | RSI 14</p>
+<button onclick="loadOptions()">Analyze Option Chain</button>
+<p id="optionStatus">Waiting...</p><div id="optionResult"></div>
+</div>
+
+<div class="card">
+<h2>🔍 Swing Stock Scanner</h2><p>EMA 20 | EMA 50 | RSI 14</p>
 <button onclick="scanSwing()">Refresh Scanner</button><p id="scanStatus">Waiting...</p>
-<div style="overflow-x:auto"><table><thead><tr><th>Stock</th><th>Price</th><th>RSI</th><th>Support</th><th>Resistance</th><th>Signal</th></tr></thead><tbody id="scanner"></tbody></table></div></div>
-<div class="card"><h2>🎯 Hilega Milega — NIFTY 50</h2>
+<div style="overflow-x:auto"><table>
+<thead><tr><th>Stock</th><th>Price</th><th>RSI</th><th>Support</th><th>Resistance</th><th>Signal</th></tr></thead>
+<tbody id="scanner"></tbody></table></div>
+</div>
+
+<div class="card">
+<h2>🎯 Hilega Milega — NIFTY 50</h2>
 <p>Daily RSI(9), weekly/monthly RSI-WMA and EMA/WMA. Close below ₹100 filter removed.</p>
 <button onclick="loadHilega()">Run Hilega Milega Scan</button>
-<button onclick="sendHilegaAlerts()">Send BUY Alerts to Telegram</button><p id="hilegaStatus">Waiting...</p>
-<div style="overflow-x:auto"><table><thead><tr><th>Stock</th><th>Price</th><th>RSI 9</th><th>Entry ref.</th><th>SL ref.</th><th>T1</th><th>T2</th><th>Signal</th></tr></thead><tbody id="hilegaRows"></tbody></table></div>
-<p><small>Approximation of the Chartink conditions shared earlier. Confirm signals in Chartink. Entry/SL/targets are indicative levels, not recommendations.</small></p></div>
-<div class="card"><h2>📘 Stock Option Chain (NSE F&O)</h2>
+<button onclick="sendHilegaAlerts()">Send BUY Alerts to Telegram</button>
+<p id="hilegaStatus">Waiting...</p>
+<div style="overflow-x:auto"><table>
+<thead><tr><th>Stock</th><th>Price</th><th>RSI 9</th><th>Entry ref.</th><th>SL ref.</th><th>T1</th><th>T2</th><th>Signal</th></tr></thead>
+<tbody id="hilegaRows"></tbody></table></div>
+<p><small>Approximation of the Chartink conditions shared earlier. Confirm signals in Chartink. Entry/SL/targets are indicative levels, not recommendations.</small></p>
+</div>
+
+<div class="card">
+<h2>📘 Stock Option Chain (NSE F&O)</h2>
 <p>Enter a NIFTY 50 stock symbol that has listed F&O contracts.</p>
 <input id="stockOptionSymbol" placeholder="e.g. RELIANCE" maxlength="20">
-<button onclick="loadStockOptions()">Analyze Stock Options</button><p id="stockOptionStatus">Waiting...</p><div id="stockOptionResult"></div></div>
-<div class="card"><h2>🤖 AI CE / PE Signal Engine — Paper Mode</h2>
-<p>Index + NIFTY 50 stock options | 15-minute EMA/RSI + option-chain PCR/OI + Hilega confirmation for stocks</p>
-<select id="signalUnderlying"><option value="NIFTY">NIFTY</option><option value="SENSEX">SENSEX</option><option value="ADANIENT">ADANIENT</option><option value="ADANIPORTS">ADANIPORTS</option><option value="APOLLOHOSP">APOLLOHOSP</option><option value="ASIANPAINT">ASIANPAINT</option><option value="AXISBANK">AXISBANK</option><option value="BAJAJ-AUTO">BAJAJ-AUTO</option><option value="BAJFINANCE">BAJFINANCE</option><option value="BAJAJFINSV">BAJAJFINSV</option><option value="BEL">BEL</option><option value="BHARTIARTL">BHARTIARTL</option><option value="CIPLA">CIPLA</option><option value="COALINDIA">COALINDIA</option><option value="DRREDDY">DRREDDY</option><option value="EICHERMOT">EICHERMOT</option><option value="ETERNAL">ETERNAL</option><option value="GRASIM">GRASIM</option><option value="HCLTECH">HCLTECH</option><option value="HDFCBANK">HDFCBANK</option><option value="HDFCLIFE">HDFCLIFE</option><option value="HEROMOTOCO">HEROMOTOCO</option><option value="HINDALCO">HINDALCO</option><option value="HINDUNILVR">HINDUNILVR</option><option value="ICICIBANK">ICICIBANK</option><option value="INDUSINDBK">INDUSINDBK</option><option value="INFY">INFY</option><option value="ITC">ITC</option><option value="JIOFIN">JIOFIN</option><option value="JSWSTEEL">JSWSTEEL</option><option value="KOTAKBANK">KOTAKBANK</option><option value="LT">LT</option><option value="M&M">M&M</option><option value="MARUTI">MARUTI</option><option value="NESTLEIND">NESTLEIND</option><option value="NTPC">NTPC</option><option value="ONGC">ONGC</option><option value="POWERGRID">POWERGRID</option><option value="RELIANCE">RELIANCE</option><option value="SBILIFE">SBILIFE</option><option value="SBIN">SBIN</option><option value="SHRIRAMFIN">SHRIRAMFIN</option><option value="SUNPHARMA">SUNPHARMA</option><option value="TATACONSUM">TATACONSUM</option><option value="TATASTEEL">TATASTEEL</option><option value="TCS">TCS</option><option value="TECHM">TECHM</option><option value="TITAN">TITAN</option><option value="TRENT">TRENT</option><option value="ULTRACEMCO">ULTRACEMCO</option><option value="WIPRO">WIPRO</option></select>
-<button onclick="runAISignal()">Generate CE / PE Signal</button><p id="aiSignalStatus">Waiting...</p><div id="aiSignalResult"></div>
-<p><small>CE/PE WATCH is a research filter, not a buy/sell instruction. SL/targets are not generated until option-premium risk rules are validated.</small></p></div>
-<div class="card"><h3>⚠️ Risk Management</h3><p>Signals are for research only. No automatic orders are placed.</p>
-<p>Market Summary and Swing Scanner use daily candles. Option-chain figures are snapshots.</p></div>
-<p><small>Market refresh: 20 seconds</small></p><p id="updated"></p>
-<script>
-async function updateMarket(){let s=document.getElementById("marketStatus");try{
-let r=await fetch("/api/market"),d=await r.json();if(!r.ok)throw Error(d.error||"Market API Error");
-for(let n of ["NIFTY 50","SENSEX"]){let x=d[n],id=n==="NIFTY 50"?"nifty":"sensex";if(!x)continue;
-let ch=x.price-x.close,p=x.close?ch/x.close*100:0;
-document.getElementById(id).innerHTML=x.price.toLocaleString("en-IN")+"<br><small>"+ch.toFixed(2)+" ("+p.toFixed(2)+"%)</small>";}
-s.innerText="Market data updated successfully";document.getElementById("updated").innerText="Last updated: "+new Date().toLocaleTimeString();
-}catch(e){s.innerText=e.message;}}
-async function loadSummary(){let s=document.getElementById("summaryStatus");s.innerText="Analyzing market...";try{
-let r=await fetch("/api/market-summary"),d=await r.json();if(!r.ok||d.status!=="success")throw Error(d.error||"Summary API Error");
-let x=d.market_summary;for(let [id,k] of [["totalStocks","total_stocks"],["bullishCount","bullish"],["bearishCount","bearish"],["neutralCount","neutral"]])document.getElementById(id).innerText=x[k];
-s.innerText="Updated: "+new Date(d.updated).toLocaleString();}catch(e){s.innerText="Error: "+e.message;}}
-async function scanSwing(){let s=document.getElementById("scanStatus"),tb=document.getElementById("scanner");s.innerText="Scanning...";try{
-let r=await fetch("/api/scanner"),d=await r.json();if(!r.ok)throw Error(d.error||"Scanner API Error");tb.innerHTML="";
-d.results.forEach(x=>{let c=x.signal==="BULLISH WATCH"?"green":x.signal==="BEARISH WATCH"?"red":"";
-tb.innerHTML+=`<tr><td>${x.stock}</td><td>${x.price}</td><td>${x.rsi}</td><td>${x.support}</td><td>${x.resistance}</td><td class="${c}">${x.signal}</td></tr>`;});
-s.innerText="Scanner completed. Stocks found: "+d.results.length;}catch(e){s.innerText=e.message;}}
-function chainHtml(d){return `<h3>Spot: ${d.spot_price}</h3><h3>ATM: ${d.atm_strike}</h3><p>Expiry: ${d.expiry}</p>
-<p>PCR: ${d.pcr} | Max Pain: ${d.max_pain}</p><p>Support (highest PE OI): ${d.support??"-"} | Resistance (highest CE OI): ${d.resistance??"-"}</p>
-<p>Total CE OI: ${d.total_ce_oi} | Total PE OI: ${d.total_pe_oi}</p><div style="overflow-x:auto"><table>
-<thead><tr><th>CE OI</th><th>CE LTP</th><th>Strike</th><th>PE LTP</th><th>PE OI</th></tr></thead><tbody>
-${d.option_chain.map(x=>`<tr><td>${x.CE?.oi??"-"}</td><td>${x.CE?.ltp??"-"}</td><td><b>${x.strike}</b></td><td>${x.PE?.ltp??"-"}</td><td>${x.PE?.oi??"-"}</td></tr>`).join("")}</tbody></table></div>`;}
-async function loadOptions(){let u=document.getElementById("underlying").value,s=document.getElementById("optionStatus"),o=document.getElementById("optionResult");s.innerText="Loading...";o.innerHTML="";
-try{let r=await fetch("/api/options/"+u),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API Error");s.innerText=u+" option chain";o.innerHTML=chainHtml(d);}catch(e){s.innerText="Error: "+e.message;}}
-async function loadHilega(){let s=document.getElementById("hilegaStatus"),tb=document.getElementById("hilegaRows");s.innerText="Scanning NIFTY 50...";
-try{let r=await fetch("/api/hilega"),d=await r.json();if(!r.ok)throw Error(d.error||"Scan failed");tb.innerHTML="";
-d.results.forEach(x=>{tb.innerHTML+=`<tr><td>${x.symbol}</td><td>${x.close}</td><td>${x.rsi}</td><td>${x.entry}</td><td>${x.stop_loss}</td><td>${x.target1}</td><td>${x.target2}</td><td class="green">${x.signal}</td></tr>`;});
-s.innerText=`Scan complete: ${d.scanned} checked, ${d.results.length} BUY candidates. ${d.updated}`;}catch(e){s.innerText="Error: "+e.message;}}
-async function sendHilegaAlerts(){let s=document.getElementById("hilegaStatus");s.innerText="Sending Telegram alert...";
-try{let r=await fetch("/api/hilega/telegram",{method:"POST"}),d=await r.json();if(!r.ok)throw Error(d.error||"Telegram failed");s.innerText=d.message;}catch(e){s.innerText="Error: "+e.message;}}
-async function loadStockOptions(){let sym=document.getElementById("stockOptionSymbol").value.trim().toUpperCase(),s=document.getElementById("stockOptionStatus"),o=document.getElementById("stockOptionResult");
-if(!sym){s.innerText="Enter a stock symbol.";return;}s.innerText="Loading "+sym+" options...";o.innerHTML="";
-try{let r=await fetch("/api/stock-options/"+encodeURIComponent(sym)),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API Error");s.innerText=sym+" option chain";o.innerHTML=chainHtml(d);}catch(e){s.innerText="Error: "+e.message;}}
-updateMarket();scanSwing();loadSummary();setInterval(updateMarket,20000);
+<button onclick="loadStockOptions()">Analyze Stock Options</button>
+<p id="stockOptionStatus">Waiting...</p><div id="stockOptionResult"></div>
+</div>
 
-async function runAISignal(){const u=document.getElementById('signalUnderlying').value,s=document.getElementById('aiSignalStatus'),o=document.getElementById('aiSignalResult');s.innerText='Analyzing '+u+'...';o.innerHTML='';try{const r=await fetch('/api/ai-signal/'+encodeURIComponent(u));const d=await r.json();if(!r.ok||d.error)throw Error(d.error||'Signal API failed');s.innerText='Analysis complete';o.innerHTML=`<h2>${d.signal}</h2><p>Spot: ${d.spot??'-'} | Expiry: ${d.expiry??'-'} | ATM: ${d.atm_strike??'-'}</p><p>Option: ${d.option_symbol??'-'} | LTP snapshot: ${d.option_ltp??'-'}</p><p>RSI 14: ${d.rsi14??'-'} | EMA 9: ${d.ema9??'-'} | EMA 21: ${d.ema21??'-'}</p><p>PCR: ${d.pcr??'-'} | Technical: ${d.technical_bias??'-'} | OI: ${d.oi_bias??'-'}</p><p>Support: ${d.support??'-'} | Resistance: ${d.resistance??'-'} | Hilega: ${d.hilega_confirmation??'-'}</p><p>${d.note||d.reason||''}</p>`;}catch(e){s.innerText='Error: '+e.message;}}
-</script></body></html>""")
+<div class="card">
+<h3>⚠️ Risk Management</h3>
+<p>Signals are for research only. No automatic orders are placed.</p>
+<p>Market Summary and Swing Scanner use daily candles. Option-chain figures are snapshots.</p>
+</div>
+<p><small>Market refresh: 20 seconds</small></p><p id="updated"></p>
+
+<script>
+async function updateMarket(){
+    let status=document.getElementById("marketStatus");
+    try{
+        let response=await fetch("/api/market");
+        let data=await response.json();
+        if(!response.ok) throw Error(data.error||"Market API Error");
+        for(let name of ["NIFTY 50","SENSEX"]){
+            let item=data[name], id=name==="NIFTY 50"?"nifty":"sensex";
+            if(!item) continue;
+            let change=item.price-item.close;
+            let percent=item.close?change/item.close*100:0;
+            document.getElementById(id).innerHTML=
+                item.price.toLocaleString("en-IN")+"<br><small>"+
+                change.toFixed(2)+" ("+percent.toFixed(2)+"%)</small>";
+        }
+        status.innerText="Market data updated successfully";
+        document.getElementById("updated").innerText=
+            "Last updated: "+new Date().toLocaleTimeString();
+    }catch(error){status.innerText=error.message;}
+}
+
+async function loadSummary(){
+    let status=document.getElementById("summaryStatus");
+    status.innerText="Analyzing market...";
+    try{
+        let response=await fetch("/api/market-summary");
+        let data=await response.json();
+        if(!response.ok||data.status!=="success")
+            throw Error(data.error||"Summary API Error");
+        let summary=data.market_summary;
+        for(let [id,key] of [
+            ["totalStocks","total_stocks"],["bullishCount","bullish"],
+            ["bearishCount","bearish"],["neutralCount","neutral"]
+        ]) document.getElementById(id).innerText=summary[key];
+        status.innerText="Updated: "+new Date(data.updated).toLocaleString();
+    }catch(error){status.innerText="Error: "+error.message;}
+}
+
+async function scanSwing(){
+    let status=document.getElementById("scanStatus");
+    let table=document.getElementById("scanner");
+    status.innerText="Scanning...";
+    try{
+        let response=await fetch("/api/scanner");
+        let data=await response.json();
+        if(!response.ok) throw Error(data.error||"Scanner API Error");
+        table.innerHTML="";
+        data.results.forEach(item=>{
+            let color=item.signal==="BULLISH WATCH"?"green":
+                item.signal==="BEARISH WATCH"?"red":"";
+            table.innerHTML+=`<tr><td>${item.stock}</td><td>${item.price}</td>
+            <td>${item.rsi}</td><td>${item.support}</td><td>${item.resistance}</td>
+            <td class="${color}">${item.signal}</td></tr>`;
+        });
+        status.innerText="Scanner completed. Stocks found: "+data.results.length;
+    }catch(error){status.innerText=error.message;}
+}
+
+async function runAISignal(){
+    let underlying=document.getElementById("signalUnderlying").value;
+    let status=document.getElementById("aiSignalStatus");
+    let output=document.getElementById("aiSignalResult");
+    status.innerText="Analyzing "+underlying+"...";
+    output.innerHTML="";
+    try{
+        let response=await fetch("/api/ai-signal/"+encodeURIComponent(underlying));
+        let data=await response.json();
+        if(!response.ok||data.error) throw Error(data.error||"Signal API failed");
+        status.innerText="Analysis complete";
+        output.innerHTML=`
+        <h2>${data.signal||"WAIT"}</h2>
+        <p>Spot: ${data.spot??"-"} | Expiry: ${data.expiry??"-"} |
+        ATM: ${data.atm_strike??"-"}</p>
+        <p>Option: ${data.option_symbol??"-"} |
+        LTP snapshot: ${data.option_ltp??"-"}</p>
+        <p>RSI 14: ${data.rsi14??"-"} | EMA 9: ${data.ema9??"-"} |
+        EMA 21: ${data.ema21??"-"}</p>
+        <p>PCR: ${data.pcr??"-"} | Technical: ${data.technical_bias??"-"} |
+        OI: ${data.oi_bias??"-"}</p>
+        <p>Support: ${data.support??"-"} | Resistance: ${data.resistance??"-"} |
+        Hilega: ${data.hilega_confirmation??"-"}</p>
+        <p>Bull score: ${data.bull_score??"-"} |
+        Bear score: ${data.bear_score??"-"}</p>
+        <p>${data.note||data.reason||""}</p>`;
+    }catch(error){status.innerText="Error: "+error.message;}
+}
+
+function chainHtml(data){
+    return `<h3>Spot: ${data.spot_price}</h3>
+    <h3>ATM: ${data.atm_strike}</h3><p>Expiry: ${data.expiry}</p>
+    <p>PCR: ${data.pcr} | Max Pain: ${data.max_pain}</p>
+    <p>Support (highest PE OI): ${data.support??"-"} |
+    Resistance (highest CE OI): ${data.resistance??"-"}</p>
+    <p>Total CE OI: ${data.total_ce_oi} | Total PE OI: ${data.total_pe_oi}</p>
+    <div style="overflow-x:auto"><table><thead><tr>
+    <th>CE OI</th><th>CE LTP</th><th>Strike</th><th>PE LTP</th><th>PE OI</th>
+    </tr></thead><tbody>
+    ${data.option_chain.map(row=>`<tr>
+    <td>${row.CE?.oi??"-"}</td><td>${row.CE?.ltp??"-"}</td>
+    <td><b>${row.strike}</b></td><td>${row.PE?.ltp??"-"}</td>
+    <td>${row.PE?.oi??"-"}</td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+async function loadOptions(){
+    let underlying=document.getElementById("underlying").value;
+    let status=document.getElementById("optionStatus");
+    let output=document.getElementById("optionResult");
+    status.innerText="Loading..."; output.innerHTML="";
+    try{
+        let response=await fetch("/api/options/"+underlying);
+        let data=await response.json();
+        if(!response.ok||data.error) throw Error(data.error||"API Error");
+        status.innerText=underlying+" option chain";
+        output.innerHTML=chainHtml(data);
+    }catch(error){status.innerText="Error: "+error.message;}
+}
+
+async function loadHilega(){
+    let status=document.getElementById("hilegaStatus");
+    let table=document.getElementById("hilegaRows");
+    status.innerText="Scanning NIFTY 50 in 5 batches...";
+    table.innerHTML="";
+    let allRows=[], scanned=0;
+    try{
+        for(let batch=0;batch<5;batch++){
+            status.innerText=`Scanning batch ${batch+1}/5 (10 stocks)...`;
+            let response=await fetch(`/api/hilega?batch=${batch}`);
+            let data=await response.json();
+            if(!response.ok) throw Error(data.error||`Batch ${batch+1} failed`);
+            allRows=allRows.concat(data.results||[]);
+            scanned+=data.scanned||0;
+        }
+        allRows.forEach(item=>{
+            table.innerHTML+=`<tr><td>${item.symbol}</td><td>${item.close}</td>
+            <td>${item.rsi}</td><td>${item.entry}</td><td>${item.stop_loss}</td>
+            <td>${item.target1}</td><td>${item.target2}</td>
+            <td class="green">${item.signal}</td></tr>`;
+        });
+        status.innerText=`Scan complete: ${scanned} checked, ${allRows.length} BUY candidates.`;
+    }catch(error){status.innerText="Error: "+error.message;}
+}
+
+async function sendHilegaAlerts(){
+    let status=document.getElementById("hilegaStatus");
+    status.innerText="Sending Telegram alert...";
+    try{
+        let response=await fetch("/api/hilega/telegram",{method:"POST"});
+        let data=await response.json();
+        if(!response.ok) throw Error(data.error||"Telegram failed");
+        status.innerText=data.message;
+    }catch(error){status.innerText="Error: "+error.message;}
+}
+
+async function loadStockOptions(){
+    let symbol=document.getElementById("stockOptionSymbol").value.trim().toUpperCase();
+    let status=document.getElementById("stockOptionStatus");
+    let output=document.getElementById("stockOptionResult");
+    if(!symbol){status.innerText="Enter a stock symbol.";return;}
+    status.innerText="Loading "+symbol+" options..."; output.innerHTML="";
+    try{
+        let response=await fetch("/api/stock-options/"+encodeURIComponent(symbol));
+        let data=await response.json();
+        if(!response.ok||data.error) throw Error(data.error||"API Error");
+        status.innerText=symbol+" option chain";
+        output.innerHTML=chainHtml(data);
+    }catch(error){status.innerText="Error: "+error.message;}
+}
+
+updateMarket();
+scanSwing();
+loadSummary();
+setInterval(updateMarket,20000);
+</script>
+</body>
+</html>
+""")
+
 
 @app.route("/login")
 def login():
@@ -203,147 +444,246 @@ def login():
         return "KITE_API_KEY missing", 500
     return redirect(kite.login_url())
 
+
 @app.route("/kite/callback")
 def callback():
     global ACCESS_TOKEN
-    token=request.args.get("request_token")
+    token = request.args.get("request_token")
     if not token or not API_SECRET or not kite:
         return "Login failed. Check credentials."
     try:
-        data=kite.generate_session(token,api_secret=API_SECRET)
-        ACCESS_TOKEN=data["access_token"]
+        data = kite.generate_session(token, api_secret=API_SECRET)
+        ACCESS_TOKEN = data["access_token"]
         kite.set_access_token(ACCESS_TOKEN)
         return redirect("/")
     except Exception as exc:
-        print("Authentication error:",exc)
+        print("Authentication error:", repr(exc))
         return "Authentication failed. Please login again."
+
 
 @app.route("/api/market")
 def market():
     if not logged_in():
-        return jsonify({"error":"Please login with Zerodha"}),401
+        return jsonify({"error": "Please login with Zerodha"}), 401
     try:
-        quotes=kite.ohlc(["NSE:NIFTY 50","BSE:SENSEX"])
-        result={}
-        for key,label in [("NSE:NIFTY 50","NIFTY 50"),("BSE:SENSEX","SENSEX")]:
+        quotes = kite.ohlc(["NSE:NIFTY 50", "BSE:SENSEX"])
+        result = {}
+        for key, label in [
+            ("NSE:NIFTY 50", "NIFTY 50"), ("BSE:SENSEX", "SENSEX")
+        ]:
             if key in quotes:
-                item=quotes[key]
-                result[label]={"price":item["last_price"],"close":item["ohlc"]["close"]}
+                item = quotes[key]
+                result[label] = {
+                    "price": item["last_price"],
+                    "close": item["ohlc"]["close"]
+                }
         return jsonify(result)
     except Exception as exc:
-        print("Market API error:",exc)
-        return jsonify({"error":"Market data unavailable. Check Zerodha login."}),502
+        print("Market API error:", repr(exc))
+        return jsonify({
+            "error": "Market data unavailable. Check Zerodha login."
+        }), 502
+
 
 @app.route("/api/market-summary")
 def market_summary():
     try:
-        return jsonify({"status":"success","market_summary":market_summary_data(),
-                        "updated":datetime.now().isoformat()})
+        return jsonify({
+            "status": "success",
+            "market_summary": market_summary_data(),
+            "updated": datetime.now().isoformat()
+        })
     except Exception as exc:
-        return jsonify({"status":"error","error":str(exc)}),500
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
 
 @app.route("/api/scanner")
 def scanner():
     try:
-        return jsonify({"results":scan_stocks(),"updated":datetime.now().isoformat()})
+        return jsonify({
+            "results": scan_stocks(),
+            "updated": datetime.now().isoformat()
+        })
     except Exception as exc:
-        return jsonify({"error":str(exc)}),502
+        return jsonify({"error": str(exc)}), 502
+
+
+def run_hilega_batches():
+    all_rows = []
+    for start in range(0, len(NIFTY50), 10):
+        for symbol in NIFTY50[start:start + 10]:
+            try:
+                result = scan_hilega_stock(symbol)
+                if result:
+                    all_rows.append(result)
+            except Exception as exc:
+                print(f"Hilega scanner skipped {symbol}: {repr(exc)}")
+            finally:
+                gc.collect()
+        gc.collect()
+    return all_rows
+
 
 @app.route("/api/hilega")
 def hilega_api():
     try:
-        rows=scan_hilega_all()
-        return jsonify({"results":rows,"scanned":50,"updated":datetime.now().isoformat(),
-                        "note":"Approximation of the Chartink conditions supplied; verify against Chartink."})
-    except Exception as exc:
-        return jsonify({"error":str(exc)}),502
+        batch = int(request.args.get("batch", "0"))
+        total_batches = (len(NIFTY50) + 9) // 10
+        if batch < 0 or batch >= total_batches:
+            return jsonify({
+                "error": f"batch must be between 0 and {total_batches - 1}"
+            }), 400
 
-@app.route("/api/hilega/telegram",methods=["POST"])
+        symbols = NIFTY50[batch * 10:(batch + 1) * 10]
+        rows = []
+        for symbol in symbols:
+            try:
+                result = scan_hilega_stock(symbol)
+                if result:
+                    rows.append(result)
+            except Exception as exc:
+                print(f"Hilega scanner skipped {symbol}: {repr(exc)}")
+            finally:
+                gc.collect()
+
+        return jsonify({
+            "results": rows,
+            "scanned": len(symbols),
+            "batch": batch + 1,
+            "total_batches": total_batches,
+            "updated": datetime.now().isoformat(),
+            "note": "Approximation of Chartink conditions; verify signals in Chartink."
+        })
+    except Exception as exc:
+        print("Hilega API error:", repr(exc))
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/hilega/telegram", methods=["POST"])
 def hilega_telegram():
     try:
-        rows=scan_hilega_all()
+        rows = run_hilega_batches()
         if not rows:
-            return jsonify({"message":"Scan complete: no BUY candidates; no Telegram alert sent."})
-        lines=["HILEGA MILEGA — NIFTY 50","Research alerts only:"]
-        for x in rows[:20]:
-            lines.append(f'{x["symbol"]} BUY WATCH | Close {x["close"]} | RSI9 {x["rsi"]} | SL {x["stop_loss"]} | T1 {x["target1"]} | T2 {x["target2"]}')
-        if not send_telegram("\\n".join(lines)):
-            return jsonify({"error":"Telegram send failed. Check TG_TOKEN and TG_CHAT_ID."}),500
-        return jsonify({"message":f"Telegram alert sent for {min(len(rows),20)} candidate(s)."})
-    except Exception as exc:
-        return jsonify({"error":str(exc)}),502
+            return jsonify({
+                "message": "Scan complete: no BUY candidates; no Telegram alert sent."
+            })
 
-@app.route("/api/options/<underlying>")
-def options_api(underlying):
-    if not logged_in():
-        return jsonify({"error":"Please login with Zerodha"}),401
-    underlying=underlying.upper()
-    if underlying not in ("NIFTY","SENSEX"):
-        return jsonify({"error":"Invalid index underlying"}),400
-    try:
-        key="NSE:NIFTY 50" if underlying=="NIFTY" else "BSE:SENSEX"
-        spot=kite.ltp(key)[key]["last_price"]
-        return jsonify(get_option_analysis(kite,underlying,spot))
-    except Exception as exc:
-        return jsonify({"error":str(exc)}),502
+        lines = ["HILEGA MILEGA — NIFTY 50", "Research alerts only:"]
+        for item in rows[:20]:
+            lines.append(
+                f'{item["symbol"]} BUY WATCH | Close {item["close"]} | '
+                f'RSI9 {item["rsi"]} | SL {item["stop_loss"]} | '
+                f'T1 {item["target1"]} | T2 {item["target2"]}'
+            )
 
-@app.route("/api/stock-options/<symbol>")
-def stock_options_api(symbol):
-    if not logged_in():
-        return jsonify({"error":"Please login with Zerodha"}),401
-    symbol=symbol.upper().strip()
-    if not symbol.isalnum():
-        return jsonify({"error":"Invalid stock symbol"}),400
-    try:
-        key=f"NSE:{symbol}"
-        spot=kite.ltp(key)[key]["last_price"]
-        result=get_option_analysis(kite,symbol,spot,exchange="NFO")
-        if result.get("error"):
-            return jsonify(result),404
-        return jsonify(result)
+        if not send_telegram("\n".join(lines)):
+            return jsonify({
+                "error": "Telegram send failed. Check TG_TOKEN and TG_CHAT_ID."
+            }), 500
+
+        return jsonify({
+            "message": f"Telegram alert sent for {min(len(rows), 20)} candidate(s)."
+        })
     except Exception as exc:
-        return jsonify({"error":str(exc)}),502
+        print("Hilega Telegram error:", repr(exc))
+        return jsonify({"error": str(exc)}), 502
+
 
 @app.route("/api/ai-signal/<underlying>")
 def ai_signal_api(underlying):
     if not logged_in():
-        return jsonify({"error":"Please login with Zerodha"}),401
-    underlying=underlying.upper().strip()
-    if underlying not in ("NIFTY","SENSEX",*NIFTY50):
-        return jsonify({"error":"Only NIFTY, SENSEX and NIFTY 50 stocks are allowed."}),400
+        return jsonify({"error": "Please login with Zerodha"}), 401
+
+    underlying = underlying.upper().strip()
     try:
         if underlying == "NIFTY":
-            quote_key="NSE:NIFTY 50"
+            quote_key = "NSE:NIFTY 50"
+            exchange = None
         elif underlying == "SENSEX":
-            quote_key="BSE:SENSEX"
+            quote_key = "BSE:SENSEX"
+            exchange = None
         else:
-            quote_key=f"NSE:{underlying}"
-        spot=float(kite.ltp(quote_key)[quote_key]["last_price"])
-        chain=get_option_analysis(kite,underlying,spot,exchange="NFO")
+            if underlying not in NIFTY50:
+                return jsonify({
+                    "error": "Only NIFTY 50 stocks are supported"
+                }), 400
+            quote_key = f"NSE:{underlying}"
+            exchange = "NFO"
+
+        spot = kite.ltp(quote_key)[quote_key]["last_price"]
+        if exchange:
+            chain = get_option_analysis(
+                kite, underlying, spot, exchange=exchange
+            )
+        else:
+            chain = get_option_analysis(kite, underlying, spot)
+
         if chain.get("error"):
-            return jsonify(chain),404
-        hilega=None
-        if underlying not in ("NIFTY","SENSEX"):
+            return jsonify(chain), 404
+
+        hilega_result = None
+        if underlying not in ("NIFTY", "SENSEX"):
             try:
-                hilega=scan_hilega_stock(underlying)
+                hilega_result = scan_hilega_stock(underlying)
             except Exception as exc:
-                print("Hilega confirmation unavailable:",underlying,exc)
-        return jsonify(build_signal(kite,underlying,spot,chain,hilega))
+                print("Hilega confirmation error:", repr(exc))
+
+        result = build_signal(
+            kite, underlying, spot, chain, hilega_result
+        )
+        return jsonify(result)
+
     except Exception as exc:
-        print("AI signal error:",repr(exc))
-        return jsonify({"error":str(exc)}),502
+        print("AI Signal API error:", repr(exc))
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/options/<underlying>")
+def options_api(underlying):
+    if not logged_in():
+        return jsonify({"error": "Please login with Zerodha"}), 401
+    underlying = underlying.upper()
+    if underlying not in ("NIFTY", "SENSEX"):
+        return jsonify({"error": "Invalid index underlying"}), 400
+    try:
+        key = "NSE:NIFTY 50" if underlying == "NIFTY" else "BSE:SENSEX"
+        spot = kite.ltp(key)[key]["last_price"]
+        return jsonify(get_option_analysis(kite, underlying, spot))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/stock-options/<symbol>")
+def stock_options_api(symbol):
+    if not logged_in():
+        return jsonify({"error": "Please login with Zerodha"}), 401
+    symbol = symbol.upper().strip()
+    if not symbol.isalnum():
+        return jsonify({"error": "Invalid stock symbol"}), 400
+    try:
+        key = f"NSE:{symbol}"
+        spot = kite.ltp(key)[key]["last_price"]
+        result = get_option_analysis(kite, symbol, spot, exchange="NFO")
+        if result.get("error"):
+            return jsonify(result), 404
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
 
 @app.route("/test-telegram")
 def test_telegram():
     if not ACCESS_TOKEN:
-        return "Please login with Zerodha first",401
+        return "Please login with Zerodha first", 401
     if send_telegram("Trading AI Dashboard: Telegram connection successful!"):
         return "Telegram Test Alert Sent Successfully!"
-    return "Telegram Alert Failed. Check Render Environment Variables.",500
+    return "Telegram Alert Failed. Check Render Environment Variables.", 500
+
 
 @app.route("/health")
 def health():
     return "Trading AI Agent Running"
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
