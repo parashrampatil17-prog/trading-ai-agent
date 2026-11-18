@@ -7,6 +7,7 @@ from kiteconnect import KiteConnect
 from options_engine import get_option_analysis
 from hilega_milega_scanner import NIFTY50, scan as scan_hilega_stock
 from signal_engine import build_signal
+from advanced_scanner import scan_market
 
 app = Flask(__name__)
 
@@ -189,6 +190,22 @@ select,input{padding:10px;border-radius:6px;max-width:100%}
 <div class="card"><h2>📈 Market Scanner</h2><p id="marketStatus">Fetching market data...</p></div>
 
 <div class="card">
+<h2>🧠 Advanced Market Scanner — Paper Mode</h2>
+<p>EMA20/50, RSI14, ADX14, daily breakout/breakdown, volume expansion and 5-minute VWAP alignment.</p>
+<p><small>Scans the 15 configured stocks using Zerodha historical data. Run manually to manage API usage.</small></p>
+<button onclick="runAdvancedScanner()">Run Advanced Scanner</button>
+<p id="advancedStatus">Waiting...</p>
+<div style="overflow-x:auto">
+<table>
+<thead><tr><th>Stock</th><th>Price</th><th>RSI</th><th>ADX</th><th>Vol x</th><th>VWAP</th><th>Bull</th><th>Bear</th><th>Signal</th></tr></thead>
+<tbody id="advancedRows"></tbody>
+</table>
+</div>
+<p id="advancedErrors"></p>
+<p><small>Research watch only. Scores are rule counts, not win probabilities. No orders are placed.</small></p>
+</div>
+
+<div class="card">
 <h2>🎯 CE / PE Signal Engine — Paper Mode</h2>
 <p>Technical trend + RSI + EMA + Option Chain PCR + Hilega Milega confirmation.</p>
 <select id="signalUnderlying">
@@ -315,6 +332,37 @@ async function scanSwing(){
         });
         status.innerText="Scanner completed. Stocks found: "+data.results.length;
     }catch(error){status.innerText=error.message;}
+}
+
+async function runAdvancedScanner(){
+    const status=document.getElementById("advancedStatus");
+    const table=document.getElementById("advancedRows");
+    const errors=document.getElementById("advancedErrors");
+    status.innerText="Scanning 15 stocks using Zerodha...";
+    table.innerHTML="";
+    errors.innerText="";
+    try{
+        const response=await fetch("/api/advanced-scan");
+        const data=await response.json();
+        if(!response.ok) throw Error(data.error||"Advanced scanner failed");
+        (data.results||[]).forEach(item=>{
+            const color=(item.signal||"").includes("BULLISH")?"green":
+                (item.signal||"").includes("BEARISH")?"red":"";
+            table.innerHTML+=`<tr>
+            <td>${item.symbol||"-"}</td><td>${item.price??"-"}</td>
+            <td>${item.rsi14??"-"}</td><td>${item.adx14??"-"}</td>
+            <td>${item.volume_ratio??"-"}</td><td>${item.vwap_5m??"-"}</td>
+            <td>${item.bull_score??"-"}</td><td>${item.bear_score??"-"}</td>
+            <td class="${color}">${item.signal||item.status||"-"}</td></tr>`;
+        });
+        const errorCount=(data.errors||[]).length;
+        status.innerText=`Scan complete: ${(data.results||[]).length} results; ${errorCount} errors. Updated ${data.updated_at||""}`;
+        if(errorCount){
+            errors.innerText=(data.errors||[]).map(x=>x.symbol+": "+x.error).join(" | ");
+        }
+    }catch(error){
+        status.innerText="Error: "+error.message;
+    }
 }
 
 async function runAISignal(){
@@ -531,6 +579,19 @@ def scanner():
         return jsonify({"error": str(exc)}), 502
 
 
+@app.route("/api/advanced-scan")
+def advanced_scan_api():
+    if not logged_in():
+        return jsonify({"error": "Please login with Zerodha"}), 401
+    try:
+        # Manual scan of the existing 15-stock watchlist to limit API calls.
+        result = scan_market(kite, STOCKS)
+        return jsonify(result)
+    except Exception as exc:
+        print("Advanced scanner error:", repr(exc))
+        return jsonify({"error": "Advanced scan failed: " + str(exc)}), 502
+
+
 def run_hilega_batches():
     all_rows = []
     for start in range(0, len(NIFTY50), 10):
@@ -590,7 +651,6 @@ def hilega_telegram():
         if not isinstance(rows, list):
             return jsonify({"error": "Invalid scan results. Run the scanner again."}), 400
 
-        # Use the results already displayed on the dashboard; do not rescan 49 stocks.
         safe_rows = []
         required = ("symbol", "close", "rsi", "stop_loss", "target1", "target2")
         for item in rows[:20]:
@@ -666,8 +726,6 @@ def ai_signal_api(underlying):
             kite, underlying, spot, chain, hilega_result
         )
 
-        # Send a Telegram snapshot only when the user manually generates analysis.
-        # This is an informational alert; it never places an order.
         def display(value):
             return "-" if value is None else str(value)
 
