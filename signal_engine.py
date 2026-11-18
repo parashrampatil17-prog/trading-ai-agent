@@ -199,15 +199,25 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
     atm = chain.get("atm_strike")
     atm_row = next((x for x in chain.get("option_chain", [])
                     if atm is not None and float(x.get("strike", -1)) == float(atm)), {})
+    # Always expose both ATM premiums for monitoring, even when signal is NO TRADE.
+    atm_ce = atm_row.get("CE", {}) or {}
+    atm_pe = atm_row.get("PE", {}) or {}
+
     option_type = "CE" if signal == "CE WATCH" else "PE"
-    contract = atm_row.get(option_type, {}) if signal in ("CE WATCH", "PE WATCH") else {}
+    contract = atm_ce if option_type == "CE" else atm_pe
+    contract = contract if signal in ("CE WATCH", "PE WATCH") else {}
     option_ltp = contract.get("ltp")
     plan = _paper_option_plan(option_ltp) if contract else _paper_option_plan(None)
 
     return {
         "underlying": underlying, "signal": signal,
         "spot": round(float(spot), 2), "expiry": chain.get("expiry"),
-        "atm_strike": atm, "option_symbol": contract.get("symbol"),
+        "atm_strike": atm,
+        "atm_ce_symbol": atm_ce.get("symbol"),
+        "atm_ce_ltp": atm_ce.get("ltp"),
+        "atm_pe_symbol": atm_pe.get("symbol"),
+        "atm_pe_ltp": atm_pe.get("ltp"),
+        "option_symbol": contract.get("symbol"),
         "option_ltp": option_ltp, "option_type": option_type if contract else None,
         "pcr": pcr, "technical_bias": technical, "oi_bias": oi_bias,
         "rsi14": round(ind5["rsi14"], 2),
@@ -224,6 +234,7 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
         "analysis_updated_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(timespec="seconds"),
         "timeframe_rule": "5-minute entry + 15-minute trend confirmation; completed candles only",
         "candle_status": "COMPLETED CANDLES ONLY",
+        "option_data_status": "ATM CE and PE LTP snapshots from option chain; verify live quote before any decision",
         "support": chain.get("support"), "resistance": chain.get("resistance"),
         "hilega_confirmation": (
             "YES" if hilega_ok else
