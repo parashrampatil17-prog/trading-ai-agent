@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from statistics import mean
 
 # Illustrative paper-test assumptions; not validated trading parameters.
@@ -64,16 +65,7 @@ def _indicators(candles):
         else "BEARISH" if last < e9 < e21 and rsi <= 45
         else "MIXED"
     )
-    last_candle = candles[-1].get("date")
-    return {
-        "close": round(last, 2),
-        "ema9": round(e9, 2),
-        "ema21": round(e21, 2),
-        "rsi14": round(rsi, 2),
-        "bias": bias,
-        "last_candle": last_candle.isoformat() if hasattr(last_candle, "isoformat") else str(last_candle),
-        "candles_count": len(closes)
-    }
+    return {"close": last, "ema9": e9, "ema21": e21, "rsi14": rsi, "bias": bias}
 
 
 def _paper_option_plan(option_ltp):
@@ -103,7 +95,8 @@ def _paper_option_plan(option_ltp):
 def build_signal(kite, underlying, spot, chain, hilega_result=None):
     underlying = str(underlying).upper().strip()
     token = _instrument_token(kite, underlying)
-    now = datetime.now()
+    # Zerodha candle timestamps and Indian market hours use Asia/Kolkata.
+    now = datetime.now(ZoneInfo('Asia/Kolkata'))
 
     candles_5m = kite.historical_data(
         token, now - timedelta(days=5), now, "5minute"
@@ -122,6 +115,27 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
             "confidence_label": "Insufficient data",
             "timeframe_5m": ind5, "timeframe_15m": ind15
         }
+
+    # During the live NSE/BSE session, reject previous-day candles as stale.
+    # Outside market hours, the latest completed session candle is expected.
+    market_open = now.weekday() < 5 and (
+        (now.hour > 9 or (now.hour == 9 and now.minute >= 15))
+        and (now.hour < 15 or (now.hour == 15 and now.minute <= 30))
+    )
+    latest5 = candles_5m[-1].get("date")
+    latest15 = candles_15m[-1].get("date")
+    if market_open:
+        for label, candle_time in (("5-minute", latest5), ("15-minute", latest15)):
+            if candle_time is None or candle_time.date() != now.date():
+                return {
+                    "underlying": underlying,
+                    "signal": "WAIT",
+                    "reason": f"Stale {label} candle data: today's candle is not available yet. No trade signal generated.",
+                    "confidence_score": 0,
+                    "confidence_label": "Stale market data",
+                    "timeframe_5m": ind5,
+                    "timeframe_15m": ind15
+                }
 
     # 5-minute chart is the entry trigger; 15-minute chart confirms trend.
     technical = (
@@ -171,11 +185,6 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
         "ema9_15m": round(ind15["ema9"], 2),
         "ema21_15m": round(ind15["ema21"], 2),
         "bias_5m": ind5["bias"], "bias_15m": ind15["bias"],
-        "last_candle_5m": ind5["last_candle"],
-        "last_candle_15m": ind15["last_candle"],
-        "candles_count_5m": ind5["candles_count"],
-        "candles_count_15m": ind15["candles_count"],
-        "analysis_updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "timeframe_rule": "5-minute entry + 15-minute trend confirmation",
         "support": chain.get("support"), "resistance": chain.get("resistance"),
         "hilega_confirmation": (
