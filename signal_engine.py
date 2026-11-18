@@ -77,6 +77,22 @@ def _indicators(candles):
     }
 
 
+
+def _completed_candles(candles, interval_minutes, now):
+    """Keep only candles whose full interval has ended (IST-aware)."""
+    completed = []
+    for candle in candles:
+        stamp = candle.get("date")
+        if stamp is None:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        else:
+            stamp = stamp.astimezone(ZoneInfo("Asia/Kolkata"))
+        if stamp + timedelta(minutes=interval_minutes) <= now:
+            completed.append(candle)
+    return completed
+
 def _paper_option_plan(option_ltp):
     keys = ("entry_zone_low", "entry_zone_high", "stop_loss",
             "target1", "target2", "risk_reward_t1", "risk_reward_t2")
@@ -112,6 +128,11 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
     candles_15m = kite.historical_data(
         token, now - timedelta(days=12), now, "15minute"
     )
+
+    # Remove the currently forming candle; use only fully closed candles.
+    candles_5m = _completed_candles(candles_5m, 5, now)
+    candles_15m = _completed_candles(candles_15m, 15, now)
+
     ind5 = _indicators(candles_5m)
     ind15 = _indicators(candles_15m)
 
@@ -201,7 +222,8 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
         "candles_count_5m": ind5["candles_count"],
         "candles_count_15m": ind15["candles_count"],
         "analysis_updated_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(timespec="seconds"),
-        "timeframe_rule": "5-minute entry + 15-minute trend confirmation",
+        "timeframe_rule": "5-minute entry + 15-minute trend confirmation; completed candles only",
+        "candle_status": "COMPLETED CANDLES ONLY",
         "support": chain.get("support"), "resistance": chain.get("resistance"),
         "hilega_confirmation": (
             "YES" if hilega_ok else
