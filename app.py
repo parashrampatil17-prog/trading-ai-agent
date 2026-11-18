@@ -246,6 +246,33 @@ select,input{padding:10px;border-radius:6px;max-width:100%}
 <button onclick="loadStockOptions()">Analyze Stock Options</button>
 <p id="stockOptionStatus">Waiting...</p><div id="stockOptionResult"></div></div>
 
+
+<div class="card"><h2>📒 Paper Trading Journal — Options + Swing</h2>
+<p><small>Manual paper entries only. Data is saved in this browser's local storage on this device; it is not synced to a server or other device.</small></p>
+<div style="display:grid;gap:8px">
+<label>Trade Type
+<select id="jType"><option value="OPTIONS">Options</option><option value="SWING">Swing Stock</option></select></label>
+<label>Symbol / Underlying <input id="jSymbol" placeholder="e.g. NIFTY, SBIN, RELIANCE"></label>
+<label>Position
+<select id="jSide"><option value="BUY">BUY (Long)</option><option value="SELL">SELL (Short)</option></select></label>
+<label>Option Type (Options only)
+<select id="jOption"><option value="CE">CE</option><option value="PE">PE</option><option value="NA">Not applicable</option></select></label>
+<label>Entry Price <input id="jEntry" type="number" step="0.01" min="0"></label>
+<label>Stop Loss <input id="jSL" type="number" step="0.01" min="0"></label>
+<label>Target 1 <input id="jT1" type="number" step="0.01" min="0"></label>
+<label>Target 2 <input id="jT2" type="number" step="0.01" min="0"></label>
+<label>Quantity <input id="jQty" type="number" step="1" min="1" value="1"></label>
+<button onclick="addPaperTrade()">Add Open Paper Trade</button>
+</div>
+<p id="journalStatus">No journal action yet.</p>
+<div style="overflow-x:auto"><table><thead><tr>
+<th>Date</th><th>Type</th><th>Symbol</th><th>Side</th><th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>Qty</th><th>Status</th><th>Exit</th><th>P&amp;L</th><th>Action</th>
+</tr></thead><tbody id="journalRows"></tbody></table></div>
+<p id="journalSummary"></p>
+<button onclick="downloadJournalCSV()">Download Journal CSV</button>
+<button onclick="clearPaperJournal()">Clear Journal</button>
+</div>
+
 <div class="card"><h3>⚠️ Paper Risk Management</h3>
 <p>Capital: ₹{{ capital }} | Illustrative risk/trade: ₹{{ risk }} | Daily loss limit: ₹{{ daily_limit }}</p>
 <p>These are display settings only. The app does not track realised daily P&amp;L or enforce a live risk lock.</p>
@@ -328,6 +355,70 @@ async function sendHilegaAlerts(){let s=document.getElementById("hilegaStatus");
  let d=await r.json();if(!r.ok)throw Error(d.error||"Telegram failed");s.innerText=d.message;}catch(e){s.innerText="Error: "+e.message;}}
 async function loadStockOptions(){let sym=document.getElementById("stockOptionSymbol").value.trim().toUpperCase(),s=document.getElementById("stockOptionStatus"),o=document.getElementById("stockOptionResult");
  if(!sym){s.innerText="Enter a symbol.";return;}s.innerText="Loading "+sym+"...";try{let r=await fetch("/api/stock-options/"+encodeURIComponent(sym)),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API error");s.innerText=sym+" option chain";o.innerHTML=chainHtml(d);}catch(e){s.innerText="Error: "+e.message;}}
+
+const JOURNAL_KEY = "trading_ai_paper_journal_v1";
+function getJournal(){try{return JSON.parse(localStorage.getItem(JOURNAL_KEY)||"[]");}catch(e){return [];}}
+function saveJournal(rows){localStorage.setItem(JOURNAL_KEY,JSON.stringify(rows));renderJournal();}
+function addPaperTrade(){
+ const type=document.getElementById("jType").value;
+ const symbol=document.getElementById("jSymbol").value.trim().toUpperCase();
+ const side=document.getElementById("jSide").value;
+ const option=document.getElementById("jOption").value;
+ const entry=Number(document.getElementById("jEntry").value);
+ const sl=Number(document.getElementById("jSL").value);
+ const t1=Number(document.getElementById("jT1").value);
+ const t2=Number(document.getElementById("jT2").value);
+ const qty=Number(document.getElementById("jQty").value);
+ const status=document.getElementById("journalStatus");
+ if(!symbol||![entry,sl,t1,t2,qty].every(Number.isFinite)||entry<=0||sl<=0||t1<=0||t2<=0||qty<=0){
+  status.innerText="Please enter symbol, valid Entry, SL, Target 1, Target 2 and Quantity.";return;
+ }
+ const rows=getJournal();
+ rows.unshift({id:Date.now(),date:new Date().toLocaleString(),type,symbol,side,option:type==="OPTIONS"?option:"-",entry,sl,t1,t2,qty,state:"OPEN",exit:null,pnl:null});
+ saveJournal(rows);status.innerText="Paper trade added. No broker order was placed.";
+ document.getElementById("jSymbol").value="";
+}
+function closePaperTrade(id){
+ const rows=getJournal(),trade=rows.find(x=>x.id===id);
+ if(!trade)return;
+ const raw=prompt("Enter paper exit price:");
+ if(raw===null)return;
+ const exit=Number(raw);
+ if(!Number.isFinite(exit)||exit<=0){alert("Enter a valid positive exit price.");return;}
+ const direction=trade.side==="BUY"?1:-1;
+ trade.exit=exit;trade.pnl=Number(((exit-trade.entry)*trade.qty*direction).toFixed(2));trade.state="CLOSED";
+ saveJournal(rows);
+}
+function renderJournal(){
+ const rows=getJournal(),body=document.getElementById("journalRows");
+ if(!body)return;
+ body.innerHTML="";
+ rows.forEach(x=>{
+  const pnl=x.pnl===null?"-":("₹"+Number(x.pnl).toFixed(2));
+  body.innerHTML+=`<tr><td>${x.date}</td><td>${x.type}</td><td>${x.symbol}${x.option&&x.option!=="-"?" "+x.option:""}</td>
+  <td>${x.side}</td><td>${x.entry}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.qty}</td>
+  <td>${x.state}</td><td>${x.exit??"-"}</td><td>${pnl}</td>
+  <td>${x.state==="OPEN"?`<button onclick="closePaperTrade(${x.id})">Close</button>`:"-"}</td></tr>`;
+ });
+ const closed=rows.filter(x=>x.state==="CLOSED"),total=closed.reduce((s,x)=>s+(Number(x.pnl)||0),0);
+ const wins=closed.filter(x=>x.pnl>0).length;
+ document.getElementById("journalSummary").innerText=
+  `Trades: ${rows.length} | Open: ${rows.length-closed.length} | Closed: ${closed.length} | Wins: ${wins} | Closed P&L: ₹${total.toFixed(2)} | Win rate: ${closed.length?(wins/closed.length*100).toFixed(1):"0.0"}%`;
+}
+function downloadJournalCSV(){
+ const rows=getJournal();if(!rows.length){alert("Journal is empty.");return;}
+ const cols=["date","type","symbol","option","side","entry","sl","t1","t2","qty","state","exit","pnl"];
+ const esc=v=>'"'+String(v??"").replace(/"/g,'""')+'"';
+ const csv=[cols.join(","),...rows.map(x=>cols.map(k=>esc(x[k])).join(","))].join("\r\n");
+ const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+ const url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download="paper_trading_journal.csv";a.click();URL.revokeObjectURL(url);
+}
+function clearPaperJournal(){
+ if(!confirm("Delete all paper journal entries from this browser? Download CSV first if needed."))return;
+ localStorage.removeItem(JOURNAL_KEY);renderJournal();document.getElementById("journalStatus").innerText="Journal cleared from this browser.";
+}
+
+renderJournal();
 updateMarket();setInterval(updateMarket,20000);
 loadSummary();
 </script></body></html>
