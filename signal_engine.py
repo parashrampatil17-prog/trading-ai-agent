@@ -117,7 +117,15 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
         elif early_bear:
             signal, option_type, confidence = "EARLY PE WATCH", "PE", 50
         else:
-            signal, option_type, confidence = "NO TRADE", None, 0
+            # PRE-SIGNAL is an early heads-up only, before full EMA alignment.
+            pre_bull = spot > ema9 and rsi14 >= 45 and pcr >= 0.90
+            pre_bear = spot < ema9 and rsi14 <= 55 and 0 < pcr <= 1.10
+            if pre_bull:
+                signal, option_type, confidence = "PRE-SIGNAL CE", "CE", 35
+            elif pre_bear:
+                signal, option_type, confidence = "PRE-SIGNAL PE", "PE", 35
+            else:
+                signal, option_type, confidence = "NO TRADE", None, 0
 
     atm = chain.get("atm_strike")
     atm_row = next((x for x in chain.get("option_chain", [])
