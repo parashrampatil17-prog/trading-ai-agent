@@ -386,6 +386,8 @@ async function loadOptions(){
     }catch(error){status.innerText="Error: "+error.message;}
 }
 
+let lastHilegaRows = [];
+
 async function loadHilega(){
     let status=document.getElementById("hilegaStatus");
     let table=document.getElementById("hilegaRows");
@@ -401,6 +403,7 @@ async function loadHilega(){
             allRows=allRows.concat(data.results||[]);
             scanned+=data.scanned||0;
         }
+        lastHilegaRows = allRows;
         allRows.forEach(item=>{
             table.innerHTML+=`<tr><td>${item.symbol}</td><td>${item.close}</td>
             <td>${item.rsi}</td><td>${item.entry}</td><td>${item.stop_loss}</td>
@@ -415,8 +418,19 @@ async function sendHilegaAlerts(){
     let status=document.getElementById("hilegaStatus");
     status.innerText="Sending Telegram alert...";
     try{
-        let response=await fetch("/api/hilega/telegram",{method:"POST"});
-        let data=await response.json();
+        if(!lastHilegaRows.length){
+            throw Error("Please run Hilega Milega Scan first.");
+        }
+        let response=await fetch("/api/hilega/telegram",{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({results:lastHilegaRows})
+        });
+        let raw=await response.text();
+        let data;
+        try{data=JSON.parse(raw);}catch(_){
+            throw Error("Server returned a non-JSON page. Please retry after dashboard reload.");
+        }
         if(!response.ok) throw Error(data.error||"Telegram failed");
         status.innerText=data.message;
     }catch(error){status.innerText="Error: "+error.message;}
@@ -571,14 +585,25 @@ def hilega_api():
 @app.route("/api/hilega/telegram", methods=["POST"])
 def hilega_telegram():
     try:
-        rows = run_hilega_batches()
-        if not rows:
+        payload = request.get_json(silent=True) or {}
+        rows = payload.get("results", [])
+        if not isinstance(rows, list):
+            return jsonify({"error": "Invalid scan results. Run the scanner again."}), 400
+
+        # Use the results already displayed on the dashboard; do not rescan 49 stocks.
+        safe_rows = []
+        required = ("symbol", "close", "rsi", "stop_loss", "target1", "target2")
+        for item in rows[:20]:
+            if isinstance(item, dict) and all(key in item for key in required):
+                safe_rows.append(item)
+
+        if not safe_rows:
             return jsonify({
-                "message": "Scan complete: no BUY candidates; no Telegram alert sent."
+                "message": "No BUY candidates in the latest scan; no Telegram alert sent."
             })
 
         lines = ["HILEGA MILEGA — NIFTY 50", "Research alerts only:"]
-        for item in rows[:20]:
+        for item in safe_rows:
             lines.append(
                 f'{item["symbol"]} BUY WATCH | Close {item["close"]} | '
                 f'RSI9 {item["rsi"]} | SL {item["stop_loss"]} | '
@@ -587,11 +612,11 @@ def hilega_telegram():
 
         if not send_telegram("\n".join(lines)):
             return jsonify({
-                "error": "Telegram send failed. Check TG_TOKEN and TG_CHAT_ID."
+                "error": "Telegram send failed. Check TG_TOKEN and TG_CHAT_ID in Render Environment Variables."
             }), 500
 
         return jsonify({
-            "message": f"Telegram alert sent for {min(len(rows), 20)} candidate(s)."
+            "message": f"Telegram alert sent for {len(safe_rows)} candidate(s)."
         })
     except Exception as exc:
         print("Hilega Telegram error:", repr(exc))
