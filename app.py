@@ -1,11 +1,10 @@
 import os
-import gc
 import requests
 from datetime import datetime
 from flask import Flask, redirect, request, jsonify, render_template_string
 from kiteconnect import KiteConnect
 from options_engine import get_option_analysis
-from hilega_milega_scanner import NIFTY50, scan as scan_hilega_stock
+from hilega_milega_scanner import scan_all as scan_hilega_all
 
 app = Flask(__name__)
 API_KEY = os.environ.get("KITE_API_KEY")
@@ -152,6 +151,11 @@ select,input{padding:10px;border-radius:6px;max-width:100%}.summary-number{font-
 <p>Enter a NIFTY 50 stock symbol that has listed F&O contracts.</p>
 <input id="stockOptionSymbol" placeholder="e.g. RELIANCE" maxlength="20">
 <button onclick="loadStockOptions()">Analyze Stock Options</button><p id="stockOptionStatus">Waiting...</p><div id="stockOptionResult"></div></div>
+<div class="card"><h2>🤖 AI CE / PE Signal Engine — Paper Mode</h2>
+<p>Index + NIFTY 50 stock options | 15-minute EMA/RSI + option-chain PCR/OI + Hilega confirmation for stocks</p>
+<select id="signalUnderlying"><option value="NIFTY">NIFTY</option><option value="SENSEX">SENSEX</option><option value="ADANIENT">ADANIENT</option><option value="ADANIPORTS">ADANIPORTS</option><option value="APOLLOHOSP">APOLLOHOSP</option><option value="ASIANPAINT">ASIANPAINT</option><option value="AXISBANK">AXISBANK</option><option value="BAJAJ-AUTO">BAJAJ-AUTO</option><option value="BAJFINANCE">BAJFINANCE</option><option value="BAJAJFINSV">BAJAJFINSV</option><option value="BEL">BEL</option><option value="BHARTIARTL">BHARTIARTL</option><option value="CIPLA">CIPLA</option><option value="COALINDIA">COALINDIA</option><option value="DRREDDY">DRREDDY</option><option value="EICHERMOT">EICHERMOT</option><option value="ETERNAL">ETERNAL</option><option value="GRASIM">GRASIM</option><option value="HCLTECH">HCLTECH</option><option value="HDFCBANK">HDFCBANK</option><option value="HDFCLIFE">HDFCLIFE</option><option value="HEROMOTOCO">HEROMOTOCO</option><option value="HINDALCO">HINDALCO</option><option value="HINDUNILVR">HINDUNILVR</option><option value="ICICIBANK">ICICIBANK</option><option value="INDUSINDBK">INDUSINDBK</option><option value="INFY">INFY</option><option value="ITC">ITC</option><option value="JIOFIN">JIOFIN</option><option value="JSWSTEEL">JSWSTEEL</option><option value="KOTAKBANK">KOTAKBANK</option><option value="LT">LT</option><option value="M&M">M&M</option><option value="MARUTI">MARUTI</option><option value="NESTLEIND">NESTLEIND</option><option value="NTPC">NTPC</option><option value="ONGC">ONGC</option><option value="POWERGRID">POWERGRID</option><option value="RELIANCE">RELIANCE</option><option value="SBILIFE">SBILIFE</option><option value="SBIN">SBIN</option><option value="SHRIRAMFIN">SHRIRAMFIN</option><option value="SUNPHARMA">SUNPHARMA</option><option value="TATACONSUM">TATACONSUM</option><option value="TATASTEEL">TATASTEEL</option><option value="TCS">TCS</option><option value="TECHM">TECHM</option><option value="TITAN">TITAN</option><option value="TRENT">TRENT</option><option value="ULTRACEMCO">ULTRACEMCO</option><option value="WIPRO">WIPRO</option></select>
+<button onclick="runAISignal()">Generate CE / PE Signal</button><p id="aiSignalStatus">Waiting...</p><div id="aiSignalResult"></div>
+<p><small>CE/PE WATCH is a research filter, not a buy/sell instruction. SL/targets are not generated until option-premium risk rules are validated.</small></p></div>
 <div class="card"><h3>⚠️ Risk Management</h3><p>Signals are for research only. No automatic orders are placed.</p>
 <p>Market Summary and Swing Scanner use daily candles. Option-chain figures are snapshots.</p></div>
 <p><small>Market refresh: 20 seconds</small></p><p id="updated"></p>
@@ -179,16 +183,18 @@ function chainHtml(d){return `<h3>Spot: ${d.spot_price}</h3><h3>ATM: ${d.atm_str
 ${d.option_chain.map(x=>`<tr><td>${x.CE?.oi??"-"}</td><td>${x.CE?.ltp??"-"}</td><td><b>${x.strike}</b></td><td>${x.PE?.ltp??"-"}</td><td>${x.PE?.oi??"-"}</td></tr>`).join("")}</tbody></table></div>`;}
 async function loadOptions(){let u=document.getElementById("underlying").value,s=document.getElementById("optionStatus"),o=document.getElementById("optionResult");s.innerText="Loading...";o.innerHTML="";
 try{let r=await fetch("/api/options/"+u),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API Error");s.innerText=u+" option chain";o.innerHTML=chainHtml(d);}catch(e){s.innerText="Error: "+e.message;}}
-async function loadHilega(){let s=document.getElementById("hilegaStatus"),tb=document.getElementById("hilegaRows");s.innerText="Scanning NIFTY 50 in 5 batches...";tb.innerHTML="";let all=[];let scanned=0;
-try{for(let batch=0;batch<5;batch++){s.innerText=`Scanning batch ${batch+1}/5 (10 stocks)...`;let r=await fetch(`/api/hilega?batch=${batch}`);let d=await r.json();if(!r.ok)throw Error(d.error||`Batch ${batch+1} failed`);all=all.concat(d.results||[]);scanned+=d.scanned||0;}
-all.forEach(x=>{tb.innerHTML+=`<tr><td>${x.symbol}</td><td>${x.close}</td><td>${x.rsi}</td><td>${x.entry}</td><td>${x.stop_loss}</td><td>${x.target1}</td><td>${x.target2}</td><td class="green">${x.signal}</td></tr>`;});
-s.innerText=`Scan complete: ${scanned} checked, ${all.length} BUY candidates.`;}catch(e){s.innerText="Error: "+e.message;}}
+async function loadHilega(){let s=document.getElementById("hilegaStatus"),tb=document.getElementById("hilegaRows");s.innerText="Scanning NIFTY 50...";
+try{let r=await fetch("/api/hilega"),d=await r.json();if(!r.ok)throw Error(d.error||"Scan failed");tb.innerHTML="";
+d.results.forEach(x=>{tb.innerHTML+=`<tr><td>${x.symbol}</td><td>${x.close}</td><td>${x.rsi}</td><td>${x.entry}</td><td>${x.stop_loss}</td><td>${x.target1}</td><td>${x.target2}</td><td class="green">${x.signal}</td></tr>`;});
+s.innerText=`Scan complete: ${d.scanned} checked, ${d.results.length} BUY candidates. ${d.updated}`;}catch(e){s.innerText="Error: "+e.message;}}
 async function sendHilegaAlerts(){let s=document.getElementById("hilegaStatus");s.innerText="Sending Telegram alert...";
 try{let r=await fetch("/api/hilega/telegram",{method:"POST"}),d=await r.json();if(!r.ok)throw Error(d.error||"Telegram failed");s.innerText=d.message;}catch(e){s.innerText="Error: "+e.message;}}
 async function loadStockOptions(){let sym=document.getElementById("stockOptionSymbol").value.trim().toUpperCase(),s=document.getElementById("stockOptionStatus"),o=document.getElementById("stockOptionResult");
 if(!sym){s.innerText="Enter a stock symbol.";return;}s.innerText="Loading "+sym+" options...";o.innerHTML="";
 try{let r=await fetch("/api/stock-options/"+encodeURIComponent(sym)),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API Error");s.innerText=sym+" option chain";o.innerHTML=chainHtml(d);}catch(e){s.innerText="Error: "+e.message;}}
 updateMarket();scanSwing();loadSummary();setInterval(updateMarket,20000);
+
+async function runAISignal(){const u=document.getElementById('signalUnderlying').value,s=document.getElementById('aiSignalStatus'),o=document.getElementById('aiSignalResult');s.innerText='Analyzing '+u+'...';o.innerHTML='';try{const r=await fetch('/api/ai-signal/'+encodeURIComponent(u));const d=await r.json();if(!r.ok||d.error)throw Error(d.error||'Signal API failed');s.innerText='Analysis complete';o.innerHTML=`<h2>${d.signal}</h2><p>Spot: ${d.spot??'-'} | Expiry: ${d.expiry??'-'} | ATM: ${d.atm_strike??'-'}</p><p>Option: ${d.option_symbol??'-'} | LTP snapshot: ${d.option_ltp??'-'}</p><p>RSI 14: ${d.rsi14??'-'} | EMA 9: ${d.ema9??'-'} | EMA 21: ${d.ema21??'-'}</p><p>PCR: ${d.pcr??'-'} | Technical: ${d.technical_bias??'-'} | OI: ${d.oi_bias??'-'}</p><p>Support: ${d.support??'-'} | Resistance: ${d.resistance??'-'} | Hilega: ${d.hilega_confirmation??'-'}</p><p>${d.note||d.reason||''}</p>`;}catch(e){s.innerText='Error: '+e.message;}}
 </script></body></html>""")
 
 @app.route("/login")
@@ -243,61 +249,28 @@ def scanner():
     except Exception as exc:
         return jsonify({"error":str(exc)}),502
 
-def run_hilega_batches():
-    """Run the full scan in groups of ten, collecting results and freeing memory."""
-    all_rows=[]
-    for start in range(0,len(NIFTY50),10):
-        for symbol in NIFTY50[start:start+10]:
-            try:
-                result=scan_hilega_stock(symbol)
-                if result:
-                    all_rows.append(result)
-            except Exception as exc:
-                print(f"Hilega scanner skipped {symbol}: {exc}")
-            finally:
-                gc.collect()
-        gc.collect()
-    return all_rows
-
 @app.route("/api/hilega")
 def hilega_api():
     try:
-        batch=int(request.args.get("batch", "0"))
-        total_batches=(len(NIFTY50)+9)//10
-        if batch<0 or batch>=total_batches:
-            return jsonify({"error":f"batch must be between 0 and {total_batches-1}"}),400
-        symbols=NIFTY50[batch*10:(batch+1)*10]
-        rows=[]
-        for symbol in symbols:
-            try:
-                result=scan_hilega_stock(symbol)
-                if result:
-                    rows.append(result)
-            except Exception as exc:
-                print(f"Hilega scanner skipped {symbol}: {exc}")
-            finally:
-                gc.collect()
-        return jsonify({"results":rows,"scanned":len(symbols),"batch":batch+1,
-                        "total_batches":total_batches,"updated":datetime.now().isoformat(),
-                        "note":"Approximation of Chartink conditions; verify signals in Chartink."})
+        rows=scan_hilega_all()
+        return jsonify({"results":rows,"scanned":50,"updated":datetime.now().isoformat(),
+                        "note":"Approximation of the Chartink conditions supplied; verify against Chartink."})
     except Exception as exc:
-        print("Hilega API error:",repr(exc))
         return jsonify({"error":str(exc)}),502
 
 @app.route("/api/hilega/telegram",methods=["POST"])
 def hilega_telegram():
     try:
-        rows=run_hilega_batches()
+        rows=scan_hilega_all()
         if not rows:
             return jsonify({"message":"Scan complete: no BUY candidates; no Telegram alert sent."})
         lines=["HILEGA MILEGA — NIFTY 50","Research alerts only:"]
         for x in rows[:20]:
             lines.append(f'{x["symbol"]} BUY WATCH | Close {x["close"]} | RSI9 {x["rsi"]} | SL {x["stop_loss"]} | T1 {x["target1"]} | T2 {x["target2"]}')
-        if not send_telegram("\n".join(lines)):
+        if not send_telegram("\\n".join(lines)):
             return jsonify({"error":"Telegram send failed. Check TG_TOKEN and TG_CHAT_ID."}),500
         return jsonify({"message":f"Telegram alert sent for {min(len(rows),20)} candidate(s)."})
     except Exception as exc:
-        print("Hilega Telegram error:",repr(exc))
         return jsonify({"error":str(exc)}),502
 
 @app.route("/api/options/<underlying>")
@@ -329,6 +302,35 @@ def stock_options_api(symbol):
             return jsonify(result),404
         return jsonify(result)
     except Exception as exc:
+        return jsonify({"error":str(exc)}),502
+
+@app.route("/api/ai-signal/<underlying>")
+def ai_signal_api(underlying):
+    if not logged_in():
+        return jsonify({"error":"Please login with Zerodha"}),401
+    underlying=underlying.upper().strip()
+    if underlying not in ("NIFTY","SENSEX",*NIFTY50):
+        return jsonify({"error":"Only NIFTY, SENSEX and NIFTY 50 stocks are allowed."}),400
+    try:
+        if underlying == "NIFTY":
+            quote_key="NSE:NIFTY 50"
+        elif underlying == "SENSEX":
+            quote_key="BSE:SENSEX"
+        else:
+            quote_key=f"NSE:{underlying}"
+        spot=float(kite.ltp(quote_key)[quote_key]["last_price"])
+        chain=get_option_analysis(kite,underlying,spot,exchange="NFO")
+        if chain.get("error"):
+            return jsonify(chain),404
+        hilega=None
+        if underlying not in ("NIFTY","SENSEX"):
+            try:
+                hilega=scan_hilega_stock(underlying)
+            except Exception as exc:
+                print("Hilega confirmation unavailable:",underlying,exc)
+        return jsonify(build_signal(kite,underlying,spot,chain,hilega))
+    except Exception as exc:
+        print("AI signal error:",repr(exc))
         return jsonify({"error":str(exc)}),502
 
 @app.route("/test-telegram")

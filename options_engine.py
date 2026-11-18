@@ -1,18 +1,11 @@
 from datetime import date
 
-INDEX_EXCHANGES = {
-    "NIFTY": "NFO",
-    "SENSEX": "BFO"
-}
-
+INDEX_EXCHANGES = {"NIFTY": "NFO", "SENSEX": "BFO"}
 
 def get_option_analysis(kite, underlying, spot_price, exchange=None):
-
     underlying = str(underlying).upper().strip()
-
-    if not underlying or spot_price <= 0:
+    if not underlying or spot_price is None or float(spot_price) <= 0:
         raise ValueError("Invalid underlying or spot price")
-
     if underlying in INDEX_EXCHANGES:
         exchange = INDEX_EXCHANGES[underlying]
         instrument_name = underlying
@@ -22,158 +15,64 @@ def get_option_analysis(kite, underlying, spot_price, exchange=None):
 
     instruments = kite.instruments(exchange)
     today = date.today()
-
     options = [
-        item for item in instruments
-        if item.get("name") == instrument_name
-        and item.get("instrument_type") in ("CE", "PE")
-        and item.get("expiry")
-        and item["expiry"] >= today
+        x for x in instruments
+        if x.get("name") == instrument_name
+        and x.get("instrument_type") in ("CE", "PE")
+        and x.get("expiry") and x["expiry"] >= today
     ]
-
     if not options:
-        return {"error": f"No active F&O contracts found for {underlying}"}
+        return {"error": f"No option contracts found for {underlying}. It may not have active F&O."}
 
-    expiry = sorted(set(
-        item["expiry"] for item in options
-    ))[0]
+    expiry = sorted({x["expiry"] for x in options})[0]
+    contracts = [x for x in options if x["expiry"] == expiry]
+    strikes = sorted({float(x["strike"]) for x in contracts})
+    atm = min(strikes, key=lambda x: abs(x - float(spot_price)))
+    idx = strikes.index(atm)
+    selected_strikes = strikes[max(0, idx - 5):idx + 6]
+    selected = [x for x in contracts if float(x["strike"]) in selected_strikes]
 
-    contracts = [
-        item for item in options
-        if item["expiry"] == expiry
-    ]
-
-    strikes = sorted(set(
-        float(item["strike"]) for item in contracts
-    ))
-
-    atm = min(
-        strikes,
-        key=lambda x: abs(x - spot_price)
-    )
-
-    atm_index = strikes.index(atm)
-
-    selected_strikes = strikes[
-        max(0, atm_index - 5):atm_index + 6
-    ]
-
-    selected = [
-        item for item in contracts
-        if float(item["strike"]) in selected_strikes
-    ]
-
-    quote_keys = [
-        f'{item["exchange"]}:{item["tradingsymbol"]}'
-        for item in selected
-    ]
-
+    keys = [f'{x["exchange"]}:{x["tradingsymbol"]}' for x in selected]
     quotes = {}
-
-    for start in range(0, len(quote_keys), 200):
-        batch = quote_keys[start:start + 200]
-        quotes.update(kite.quote(batch))
+    for start in range(0, len(keys), 200):
+        quotes.update(kite.quote(keys[start:start + 200]))
 
     chain = {}
-
     for item in selected:
-
         strike = float(item["strike"])
-        option_type = item["instrument_type"]
-
+        typ = item["instrument_type"]
         key = f'{item["exchange"]}:{item["tradingsymbol"]}'
         q = quotes.get(key, {})
-
-        if strike not in chain:
-            chain[strike] = {
-                "strike": strike,
-                "CE": {},
-                "PE": {}
-            }
-
-        chain[strike][option_type] = {
+        chain.setdefault(strike, {"strike": strike, "CE": {}, "PE": {}})
+        chain[strike][typ] = {
             "symbol": item["tradingsymbol"],
             "ltp": q.get("last_price", 0),
             "oi": q.get("oi", 0),
-            "volume": q.get("volume", 0)
+            "volume": q.get("volume", 0),
         }
 
-    rows = sorted(
-        chain.values(),
-        key=lambda x: x["strike"]
-    )
+    rows = sorted(chain.values(), key=lambda x: x["strike"])
+    ce_oi = sum(x["CE"].get("oi", 0) for x in rows)
+    pe_oi = sum(x["PE"].get("oi", 0) for x in rows)
+    pcr = round(pe_oi / ce_oi, 2) if ce_oi else 0
 
-    total_ce_oi = sum(
-        x["CE"].get("oi", 0) for x in rows
-    )
-
-    total_pe_oi = sum(
-        x["PE"].get("oi", 0) for x in rows
-    )
-
-    pcr = (
-        round(total_pe_oi / total_ce_oi, 2)
-        if total_ce_oi else 0
-    )
-
-    max_pain_values = {}
-
+    pains = {}
     for settlement in selected_strikes:
-
         pain = 0
-
         for row in rows:
-
             strike = row["strike"]
+            pain += row["CE"].get("oi", 0) * max(0, settlement - strike)
+            pain += row["PE"].get("oi", 0) * max(0, strike - settlement)
+        pains[settlement] = pain
 
-            pain += (
-                row["CE"].get("oi", 0)
-                * max(0, settlement - strike)
-            )
-
-            pain += (
-                row["PE"].get("oi", 0)
-                * max(0, strike - settlement)
-            )
-
-        max_pain_values[settlement] = pain
-
-    max_pain = min(
-        max_pain_values,
-        key=max_pain_values.get
-    )
-
-    pe_rows = [
-        x for x in rows
-        if x["PE"].get("oi", 0) > 0
-    ]
-
-    ce_rows = [
-        x for x in rows
-        if x["CE"].get("oi", 0) > 0
-    ]
-
-    support = (
-        max(pe_rows, key=lambda x: x["PE"]["oi"])["strike"]
-        if pe_rows else None
-    )
-
-    resistance = (
-        max(ce_rows, key=lambda x: x["CE"]["oi"])["strike"]
-        if ce_rows else None
-    )
-
+    pe_rows = [x for x in rows if x["PE"].get("oi", 0) > 0]
+    ce_rows = [x for x in rows if x["CE"].get("oi", 0) > 0]
     return {
-        "underlying": underlying,
-        "exchange": exchange,
-        "spot_price": spot_price,
-        "expiry": expiry.isoformat(),
-        "atm_strike": atm,
-        "total_ce_oi": total_ce_oi,
-        "total_pe_oi": total_pe_oi,
-        "pcr": pcr,
-        "max_pain": max_pain,
-        "support": support,
-        "resistance": resistance,
-        "option_chain": rows
+        "underlying": underlying, "exchange": exchange,
+        "spot_price": float(spot_price), "expiry": expiry.isoformat(),
+        "atm_strike": atm, "total_ce_oi": ce_oi, "total_pe_oi": pe_oi,
+        "pcr": pcr, "max_pain": min(pains, key=pains.get),
+        "support": max(pe_rows, key=lambda x: x["PE"]["oi"])["strike"] if pe_rows else None,
+        "resistance": max(ce_rows, key=lambda x: x["CE"]["oi"])["strike"] if ce_rows else None,
+        "option_chain": rows,
     }
