@@ -255,18 +255,21 @@ select,input{padding:10px;border-radius:6px;max-width:100%}
 <label>Symbol / Underlying <input id="jSymbol" placeholder="e.g. NIFTY, SBIN, RELIANCE"></label>
 <label>Position
 <select id="jSide"><option value="BUY">BUY (Long)</option><option value="SELL">SELL (Short)</option></select></label>
-<label>Option Type (Options only)
-<select id="jOption"><option value="CE">CE</option><option value="PE">PE</option><option value="NA">Not applicable</option></select></label>
+<label id="jOptionWrap">Option Type
+<select id="jOption"><option value="CE">CE</option><option value="PE">PE</option></select></label>
+<label id="jExpiryWrap">Expiry Date <input id="jExpiry" type="date"></label>
+<label id="jStrikeWrap">Strike Price <input id="jStrike" type="number" step="0.05" min="0" placeholder="e.g. 26000"></label>
 <label>Entry Price <input id="jEntry" type="number" step="0.01" min="0"></label>
 <label>Stop Loss <input id="jSL" type="number" step="0.01" min="0"></label>
 <label>Target 1 <input id="jT1" type="number" step="0.01" min="0"></label>
 <label>Target 2 <input id="jT2" type="number" step="0.01" min="0"></label>
-<label>Quantity <input id="jQty" type="number" step="1" min="1" value="1"></label>
+<label id="jLotSizeWrap">Lot Size (units per lot) <input id="jLotSize" type="number" step="1" min="1" value="1"></label>
+<label><span id="jQtyLabel">Number of Lots</span> <input id="jQty" type="number" step="1" min="1" value="1"></label>
 <button onclick="addPaperTrade()">Add Open Paper Trade</button>
 </div>
 <p id="journalStatus">No journal action yet.</p>
 <div style="overflow-x:auto"><table><thead><tr>
-<th>Date</th><th>Type</th><th>Symbol</th><th>Side</th><th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>Qty</th><th>Status</th><th>Exit</th><th>P&amp;L</th><th>Action</th>
+<th>Date</th><th>Type</th><th>Symbol</th><th>Option</th><th>Expiry</th><th>Strike</th><th>Side</th><th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>Lots/Qty</th><th>Lot Size</th><th>Status</th><th>Exit</th><th>P&amp;L</th><th>Action</th>
 </tr></thead><tbody id="journalRows"></tbody></table></div>
 <p id="journalSummary"></p>
 <button onclick="downloadJournalCSV()">Download Journal CSV</button>
@@ -359,22 +362,37 @@ async function loadStockOptions(){let sym=document.getElementById("stockOptionSy
 const JOURNAL_KEY = "trading_ai_paper_journal_v1";
 function getJournal(){try{return JSON.parse(localStorage.getItem(JOURNAL_KEY)||"[]");}catch(e){return [];}}
 function saveJournal(rows){localStorage.setItem(JOURNAL_KEY,JSON.stringify(rows));renderJournal();}
+function updateJournalFields(){
+ const isOptions=document.getElementById("jType").value==="OPTIONS";
+ for(const id of ["jOptionWrap","jExpiryWrap","jStrikeWrap","jLotSizeWrap"])
+  document.getElementById(id).style.display=isOptions?"block":"none";
+ document.getElementById("jQtyLabel").innerText=isOptions?"Number of Lots":"Quantity";
+}
 function addPaperTrade(){
  const type=document.getElementById("jType").value;
  const symbol=document.getElementById("jSymbol").value.trim().toUpperCase();
  const side=document.getElementById("jSide").value;
  const option=document.getElementById("jOption").value;
+ const expiry=document.getElementById("jExpiry").value;
+ const strike=Number(document.getElementById("jStrike").value);
+ const lotSize=type==="OPTIONS"?Number(document.getElementById("jLotSize").value):1;
  const entry=Number(document.getElementById("jEntry").value);
  const sl=Number(document.getElementById("jSL").value);
  const t1=Number(document.getElementById("jT1").value);
  const t2=Number(document.getElementById("jT2").value);
  const qty=Number(document.getElementById("jQty").value);
  const status=document.getElementById("journalStatus");
- if(!symbol||![entry,sl,t1,t2,qty].every(Number.isFinite)||entry<=0||sl<=0||t1<=0||t2<=0||qty<=0){
-  status.innerText="Please enter symbol, valid Entry, SL, Target 1, Target 2 and Quantity.";return;
+ if(!symbol||![entry,sl,t1,t2,qty,lotSize].every(Number.isFinite)||entry<=0||sl<=0||t1<=0||t2<=0||qty<=0||lotSize<=0){
+  status.innerText="Enter valid symbol, Entry, SL, Targets, Quantity/Lots and Lot Size.";return;
+ }
+ if(type==="OPTIONS"&&(!expiry||!Number.isFinite(strike)||strike<=0)){
+  status.innerText="For Options, enter Expiry Date and Strike Price.";return;
  }
  const rows=getJournal();
- rows.unshift({id:Date.now(),date:new Date().toLocaleString(),type,symbol,side,option:type==="OPTIONS"?option:"-",entry,sl,t1,t2,qty,state:"OPEN",exit:null,pnl:null});
+ rows.unshift({id:Date.now(),date:new Date().toLocaleString(),type,symbol,side,
+  option:type==="OPTIONS"?option:"-",expiry:type==="OPTIONS"?expiry:"-",
+  strike:type==="OPTIONS"?strike:null,lotSize:type==="OPTIONS"?lotSize:1,
+  entry,sl,t1,t2,qty,state:"OPEN",exit:null,pnl:null});
  saveJournal(rows);status.innerText="Paper trade added. No broker order was placed.";
  document.getElementById("jSymbol").value="";
 }
@@ -386,7 +404,8 @@ function closePaperTrade(id){
  const exit=Number(raw);
  if(!Number.isFinite(exit)||exit<=0){alert("Enter a valid positive exit price.");return;}
  const direction=trade.side==="BUY"?1:-1;
- trade.exit=exit;trade.pnl=Number(((exit-trade.entry)*trade.qty*direction).toFixed(2));trade.state="CLOSED";
+ const multiplier=trade.type==="OPTIONS"?(Number(trade.lotSize)||1):1;
+ trade.exit=exit;trade.pnl=Number(((exit-trade.entry)*trade.qty*multiplier*direction).toFixed(2));trade.state="CLOSED";
  saveJournal(rows);
 }
 function renderJournal(){
@@ -395,8 +414,9 @@ function renderJournal(){
  body.innerHTML="";
  rows.forEach(x=>{
   const pnl=x.pnl===null?"-":("₹"+Number(x.pnl).toFixed(2));
-  body.innerHTML+=`<tr><td>${x.date}</td><td>${x.type}</td><td>${x.symbol}${x.option&&x.option!=="-"?" "+x.option:""}</td>
-  <td>${x.side}</td><td>${x.entry}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.qty}</td>
+  body.innerHTML+=`<tr><td>${x.date}</td><td>${x.type}</td><td>${x.symbol}</td><td>${x.option??"-"}</td>
+  <td>${x.expiry??"-"}</td><td>${x.strike??"-"}</td><td>${x.side}</td><td>${x.entry}</td><td>${x.sl}</td>
+  <td>${x.t1}</td><td>${x.t2}</td><td>${x.qty}</td><td>${x.type==="OPTIONS"?(x.lotSize??1):"-"}</td>
   <td>${x.state}</td><td>${x.exit??"-"}</td><td>${pnl}</td>
   <td>${x.state==="OPEN"?`<button onclick="closePaperTrade(${x.id})">Close</button>`:"-"}</td></tr>`;
  });
@@ -407,7 +427,7 @@ function renderJournal(){
 }
 function downloadJournalCSV(){
  const rows=getJournal();if(!rows.length){alert("Journal is empty.");return;}
- const cols=["date","type","symbol","option","side","entry","sl","t1","t2","qty","state","exit","pnl"];
+ const cols=["date","type","symbol","option","expiry","strike","side","entry","sl","t1","t2","qty","lotSize","state","exit","pnl"];
  const esc=v=>'"'+String(v??"").replace(/"/g,'""')+'"';
  const csv=[cols.join(","),...rows.map(x=>cols.map(k=>esc(x[k])).join(","))].join("\r\n");
  const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
@@ -418,6 +438,8 @@ function clearPaperJournal(){
  localStorage.removeItem(JOURNAL_KEY);renderJournal();document.getElementById("journalStatus").innerText="Journal cleared from this browser.";
 }
 
+updateJournalFields();
+document.getElementById("jType").addEventListener("change",updateJournalFields);
 renderJournal();
 updateMarket();setInterval(updateMarket,20000);
 loadSummary();
