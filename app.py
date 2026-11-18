@@ -260,7 +260,6 @@ async function updateMarket(){
   for(let name of ["NIFTY 50","SENSEX"]){let x=d[name],id=name==="NIFTY 50"?"nifty":"sensex";if(!x)continue;
    let ch=x.price-x.close,p=x.close?ch/x.close*100:0;
    document.getElementById(id).innerHTML=x.price.toLocaleString("en-IN")+"<br><small>"+ch.toFixed(2)+" ("+p.toFixed(2)+"%)</small>";}
-  document.getElementById("marketStatus")?.innerText="Market data updated";
   document.getElementById("updated").innerText="Last updated: "+new Date().toLocaleTimeString();
  }catch(e){console.log(e.message);}
 }
