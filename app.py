@@ -327,7 +327,7 @@ async function runAISignal(){
         let response=await fetch("/api/ai-signal/"+encodeURIComponent(underlying));
         let data=await response.json();
         if(!response.ok||data.error) throw Error(data.error||"Signal API failed");
-        status.innerText="Analysis complete";
+        status.innerText="Analysis complete" + (data.telegram_alert_sent ? " | Telegram alert sent" : " | Telegram alert not sent — check Render Telegram settings");
         output.innerHTML=`
         <h2>${data.signal||"WAIT"}</h2>
         <p>Spot: ${data.spot??"-"} | Expiry: ${data.expiry??"-"} |
@@ -639,6 +639,29 @@ def ai_signal_api(underlying):
 
         result = build_signal(
             kite, underlying, spot, chain, hilega_result
+        )
+
+        # Send a Telegram snapshot only when the user manually generates analysis.
+        # This is an informational alert; it never places an order.
+        def display(value):
+            return "-" if value is None else str(value)
+
+        message = (
+            f"TRADING AI — {underlying} PAPER MODE\n"
+            f"Signal: {display(result.get('signal'))}\n"
+            f"Spot: {display(result.get('spot'))} | ATM: {display(result.get('atm_strike'))}\n"
+            f"Expiry: {display(result.get('expiry'))}\n"
+            f"ATM CE: {display(result.get('atm_ce_symbol'))} | LTP: {display(result.get('atm_ce_ltp'))}\n"
+            f"ATM PE: {display(result.get('atm_pe_symbol'))} | LTP: {display(result.get('atm_pe_ltp'))}\n"
+            f"PCR: {display(result.get('pcr'))} | Technical: {display(result.get('technical_bias'))} | OI: {display(result.get('oi_bias'))}\n"
+            f"5m: {display(result.get('bias_5m'))} | 15m: {display(result.get('bias_15m'))}\n"
+            "Research alert only. Verify live price, spread and liquidity. No order placed."
+        )
+        alert_sent = send_telegram(message)
+        result["telegram_alert_sent"] = alert_sent
+        result["telegram_alert_status"] = (
+            "Telegram alert sent" if alert_sent
+            else "Telegram alert not sent; check TG_TOKEN and TG_CHAT_ID in Render"
         )
         return jsonify(result)
 
