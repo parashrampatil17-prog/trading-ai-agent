@@ -117,27 +117,27 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
         elif early_bear:
             signal, option_type, confidence = "EARLY PE WATCH", "PE", 50
         else:
-            # PRE-SIGNAL is an early heads-up only, before full EMA alignment.
-            pre_bull = spot > ema9 and rsi14 >= 45 and pcr >= 0.90
-            pre_bear = spot < ema9 and rsi14 <= 55 and 0 < pcr <= 1.10
-            if pre_bull:
-                signal, option_type, confidence = "PRE-SIGNAL CE", "CE", 35
-            elif pre_bear:
-                signal, option_type, confidence = "PRE-SIGNAL PE", "PE", 35
-            else:
-                signal, option_type, confidence = "NO TRADE", None, 0
+            signal, option_type, confidence = "NO TRADE", None, 0
 
     atm = chain.get("atm_strike")
     atm_row = next((x for x in chain.get("option_chain", [])
                     if atm is not None and float(x.get("strike", -1)) == float(atm)), {})
-    contract = atm_row.get(option_type, {}) if option_type else {}
+    # Always return both ATM option quotes, even when there is no trade signal.
+    atm_ce = atm_row.get("CE", {}) or {}
+    atm_pe = atm_row.get("PE", {}) or {}
+    contract = atm_ce if option_type == "CE" else atm_pe if option_type == "PE" else {}
     option_ltp = contract.get("ltp")
     plan = _paper_option_plan(option_ltp) if contract else _paper_option_plan(None)
 
     return {
         "underlying": underlying, "signal": signal,
         "spot": round(float(spot), 2), "expiry": chain.get("expiry"),
-        "atm_strike": atm, "option_symbol": contract.get("symbol"),
+        "atm_strike": atm,
+        "atm_ce_symbol": atm_ce.get("symbol"),
+        "atm_ce_ltp": atm_ce.get("ltp"),
+        "atm_pe_symbol": atm_pe.get("symbol"),
+        "atm_pe_ltp": atm_pe.get("ltp"),
+        "option_symbol": contract.get("symbol"),
         "option_ltp": option_ltp, "option_type": option_type,
         "pcr": pcr, "technical_bias": technical, "oi_bias": oi_bias,
         "rsi14": round(rsi14, 2), "ema9": round(ema9, 2),
