@@ -51,12 +51,27 @@ def _instrument_token(kite, underlying):
     return item["instrument_token"]
 
 
+def _indicators(candles):
+    closes = [float(x["close"]) for x in candles if x.get("close") is not None]
+    if len(closes) < 30:
+        return None
+    e9, e21, rsi = _ema(closes, 9), _ema(closes, 21), _rsi(closes, 14)
+    if e9 is None or e21 is None or rsi is None:
+        return None
+    last = closes[-1]
+    bias = (
+        "BULLISH" if last > e9 > e21 and rsi >= 55
+        else "BEARISH" if last < e9 < e21 and rsi <= 45
+        else "MIXED"
+    )
+    return {"close": last, "ema9": e9, "ema21": e21, "rsi14": rsi, "bias": bias}
+
+
 def _paper_option_plan(option_ltp):
+    keys = ("entry_zone_low", "entry_zone_high", "stop_loss",
+            "target1", "target2", "risk_reward_t1", "risk_reward_t2")
     if option_ltp is None or float(option_ltp) <= 0:
-        return {key: None for key in (
-            "entry_zone_low", "entry_zone_high", "stop_loss",
-            "target1", "target2", "risk_reward_t1", "risk_reward_t2"
-        )}
+        return {key: None for key in keys}
     premium = float(option_ltp)
     entry_low = premium
     entry_high = premium * (1 + PAPER_ENTRY_BUFFER_PCT)
@@ -80,32 +95,32 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
     underlying = str(underlying).upper().strip()
     token = _instrument_token(kite, underlying)
     now = datetime.now()
-    candles = kite.historical_data(
+
+    candles_5m = kite.historical_data(
+        token, now - timedelta(days=5), now, "5minute"
+    )
+    candles_15m = kite.historical_data(
         token, now - timedelta(days=12), now, "15minute"
     )
-    closes = [float(x["close"]) for x in candles if x.get("close") is not None]
-    if len(closes) < 30:
+    ind5 = _indicators(candles_5m)
+    ind15 = _indicators(candles_15m)
+
+    if not ind5 or not ind15:
         return {
-            "signal": "WAIT",
-            "reason": "Not enough 15-minute candles for confirmation.",
-            "underlying": underlying, "confidence_score": 0,
-            "confidence_label": "Insufficient data"
+            "underlying": underlying, "signal": "WAIT",
+            "reason": "Not enough completed 5-minute or 15-minute candles.",
+            "confidence_score": 0,
+            "confidence_label": "Insufficient data",
+            "timeframe_5m": ind5, "timeframe_15m": ind15
         }
 
-    ema9, ema21, rsi14 = _ema(closes, 9), _ema(closes, 21), _rsi(closes, 14)
-    if ema9 is None or ema21 is None or rsi14 is None:
-        return {
-            "signal": "WAIT", "reason": "Indicator data unavailable.",
-            "underlying": underlying, "confidence_score": 0,
-            "confidence_label": "Insufficient data"
-        }
-
-    pcr = float(chain.get("pcr") or 0)
+    # 5-minute chart is the entry trigger; 15-minute chart confirms trend.
     technical = (
-        "BULLISH" if spot > ema9 > ema21 and rsi14 >= 55
-        else "BEARISH" if spot < ema9 < ema21 and rsi14 <= 45
+        "BULLISH" if ind5["bias"] == "BULLISH" and ind15["bias"] == "BULLISH"
+        else "BEARISH" if ind5["bias"] == "BEARISH" and ind15["bias"] == "BEARISH"
         else "MIXED"
     )
+    pcr = float(chain.get("pcr") or 0)
     oi_bias = (
         "BULLISH" if pcr >= 1.10
         else "BEARISH" if 0 < pcr <= 0.85
@@ -120,8 +135,6 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
         else "PE WATCH" if bear >= 3 and technical == "BEARISH"
         else "NO TRADE"
     )
-
-    # Rule score only; this is NOT a statistical probability of profit.
     confidence = (
         round(bull / 4 * 100) if signal == "CE WATCH"
         else round(bear / 4 * 100) if signal == "PE WATCH"
@@ -142,9 +155,15 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
         "atm_strike": atm, "option_symbol": contract.get("symbol"),
         "option_ltp": option_ltp, "option_type": option_type if contract else None,
         "pcr": pcr, "technical_bias": technical, "oi_bias": oi_bias,
-        "rsi14": round(rsi14, 2), "ema9": round(ema9, 2),
-        "ema21": round(ema21, 2), "support": chain.get("support"),
-        "resistance": chain.get("resistance"),
+        "rsi14": round(ind5["rsi14"], 2),
+        "ema9": round(ind5["ema9"], 2),
+        "ema21": round(ind5["ema21"], 2),
+        "rsi14_15m": round(ind15["rsi14"], 2),
+        "ema9_15m": round(ind15["ema9"], 2),
+        "ema21_15m": round(ind15["ema21"], 2),
+        "bias_5m": ind5["bias"], "bias_15m": ind15["bias"],
+        "timeframe_rule": "5-minute entry + 15-minute trend confirmation",
+        "support": chain.get("support"), "resistance": chain.get("resistance"),
         "hilega_confirmation": (
             "YES" if hilega_ok else
             "NOT APPLICABLE" if underlying in ("NIFTY", "SENSEX") else "NO"
@@ -154,13 +173,13 @@ def build_signal(kite, underlying, spot, chain, hilega_result=None):
         "confidence_label": "Rule-based confirmation score, not win probability",
         **plan,
         "plan_note": (
-            "Illustrative paper plan from the current option LTP snapshot: "
-            "entry band up to 2% above snapshot, stop 20% below reference entry, "
-            "targets 25% and 50% above reference entry. These assumptions are "
-            "not validated and must be paper-tested before any use."
+            "Illustrative paper plan based on the option LTP snapshot; "
+            "entry band +2%, stop -20%, targets +25% and +50%. "
+            "These assumptions are not validated."
         ),
         "note": (
-            "Research/paper mode only. Option LTP is a snapshot; verify live "
-            "price, spread, liquidity and chart. No order is placed."
+            "Paper mode only. 5m is the entry trigger and 15m confirms trend. "
+            "Verify candle freshness, live option price, spread and liquidity. "
+            "No order is placed."
         )
     }
