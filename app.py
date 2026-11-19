@@ -605,11 +605,48 @@ def ai_signal_api(underlying):
         signal_text = str(result.get("signal", "")).upper()
         alertable = any(tag in signal_text for tag in ("CE WATCH", "PE WATCH", "EARLY CE", "EARLY PE", "PRE-SIGNAL CE", "PRE-SIGNAL PE"))
         if alertable:
+            # Show the option-premium plan returned by signal_engine.
+            # If contract LTP or plan values are unavailable, say so instead
+            # of inventing an entry, stop loss, or target.
+            option_symbol = result.get("option_symbol") or "Not available"
+            option_type = result.get("option_type") or (
+                "CE" if "CE" in signal_text else "PE" if "PE" in signal_text else "N/A"
+            )
+            option_ltp = result.get("option_ltp")
+            entry_low = result.get("entry_zone_low")
+            entry_high = result.get("entry_zone_high")
+            stop_loss = result.get("stop_loss")
+            target1 = result.get("target1")
+            target2 = result.get("target2")
+            rr1 = result.get("risk_reward_t1")
+            rr2 = result.get("risk_reward_t2")
+
+            def fmt(value):
+                try:
+                    return f"{float(value):.2f}" if value is not None else "N/A"
+                except (TypeError, ValueError):
+                    return "N/A"
+
+            if entry_low is not None and entry_high is not None:
+                entry_text = f"{fmt(entry_low)} – {fmt(entry_high)}"
+            else:
+                entry_text = "N/A — option LTP/plan unavailable"
+
             message = (
-                f"TRADING AI — {underlying} PAPER MODE\nSignal: {signal_text}\n"
-                f"Spot: {result.get('spot')} | ATM: {result.get('atm_strike')} | Expiry: {result.get('expiry')}\n"
-                f"PCR: {result.get('pcr')} | 5m: {result.get('bias_5m')} | 15m: {result.get('bias_15m')}\n"
-                "Research alert only. Verify price, spread and liquidity. No order placed."
+                f"TRADING AI — {underlying} PAPER MODE\\n"
+                f"Signal: {signal_text}\\n"
+                f"Spot: {fmt(result.get('spot'))} | ATM: {result.get('atm_strike') or 'N/A'} | "
+                f"Expiry: {result.get('expiry') or 'N/A'}\\n"
+                f"Contract: {option_symbol} ({option_type})\\n"
+                f"Option LTP snapshot: ₹{fmt(option_ltp)}\\n"
+                f"Paper Entry Zone: ₹{entry_text}\\n"
+                f"Stop Loss: ₹{fmt(stop_loss)}\\n"
+                f"Target 1: ₹{fmt(target1)} | Target 2: ₹{fmt(target2)}\\n"
+                f"Indicative R:R: T1 {fmt(rr1)} | T2 {fmt(rr2)}\\n"
+                f"PCR: {fmt(result.get('pcr'))} | 5m: {result.get('bias_5m', 'N/A')} | "
+                f"15m: {result.get('bias_15m', 'N/A')}\\n"
+                "Plan uses illustrative, unvalidated percentages from the current option LTP snapshot.\\n"
+                "Research alert only. Verify live price, spread and liquidity. No order placed."
             )
             alert_sent = send_telegram(message)
         else:
