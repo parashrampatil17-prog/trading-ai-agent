@@ -2,15 +2,33 @@ import os
 import gc
 import time
 import requests
-from datetime import datetime
-from flask import Flask, redirect, request, jsonify, render_template_string
+from datetime import datetime, timedelta
+from functools import wraps
+import secrets
+import hashlib
+from flask import Flask, redirect, request, jsonify, render_template_string, session, abort
 from kiteconnect import KiteConnect
 from options_engine import get_option_analysis
 from hilega_milega_scanner import scan as scan_hilega_stock
 from signal_engine import build_signal
 from advanced_scanner import scan_market
+from live_order_manager import get_order_intents
+from broker_reconciliation import reconcile_broker_state, list_exit_watches
+from auto_execution_guard import get_guard_state, set_kill_switch
+
+EXECUTION_DB_PATH = os.environ.get("TRADING_AI_DB_PATH", "trading_ai_guard.sqlite3")
 
 app = Flask(__name__)
+# Set FLASK_SECRET_KEY to a long random value in Render Environment Variables.
+app.secret_key = os.environ.get("FLASK_SECRET_KEY")
+if not app.secret_key or len(app.secret_key) < 32:
+    raise RuntimeError("Set FLASK_SECRET_KEY to a random value of at least 32 characters")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,       # Dashboard must be served over HTTPS.
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+)
 
 API_KEY = os.environ.get("KITE_API_KEY")
 API_SECRET = os.environ.get("KITE_API_SECRET")
@@ -138,7 +156,7 @@ def scan_stocks():
                 "resistance": round(max(highs[-20:]), 2), "signal": signal
             })
         except Exception as exc:
-            errors.append({"symbol": stock, "error": str(exc)})
+            errors.append({"symbol": stock, "error": "Data unavailable"})
             print("Scanner error:", stock, repr(exc))
     return results, errors
 
@@ -160,23 +178,60 @@ def market_summary_data():
 
 
 def logged_in():
-    return bool(kite and ACCESS_TOKEN)
+    # A valid Zerodha token alone must not authorize every visitor's browser.
+    return bool(
+        kite and ACCESS_TOKEN
+        and session.get("authenticated") is True
+        and session.get("token_fingerprint") == hashlib.sha256(ACCESS_TOKEN.encode()).hexdigest()
+    )
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not logged_in():
+            return jsonify({"error": "Please login with Zerodha"}), 401
+        return view(*args, **kwargs)
+    return wrapped
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+@app.before_request
+def protect_state_changing_requests():
+    # CSRF protection for browser-originated POST requests.
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        expected = session.get("csrf_token")
+        supplied = request.headers.get("X-CSRF-Token")
+        if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+            abort(403)
 
 
 @app.route("/")
 def home():
     if not kite:
         return "KITE_API_KEY missing. Check Render Environment Variables."
-    if not ACCESS_TOKEN:
+    if not logged_in():
         return '<h2>Trading AI Dashboard</h2><a href="/login">Login with Zerodha</a>'
 
+    session.permanent = True
+    session.setdefault("csrf_token", secrets.token_urlsafe(32))
+    csrf_token = session["csrf_token"]
     stock_options = "".join(
         f'<option value="{symbol}">{symbol}</option>' for symbol in STOCKS
     )
     return render_template_string(r"""
 <!DOCTYPE html>
 <html><head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">\n<meta name="csrf-token" content="{{ csrf_token }}">
 <title>Trading AI Dashboard</title>
 <style>
 body{font-family:Arial;background:#101827;color:white;padding:15px}
@@ -283,13 +338,14 @@ select,input{padding:10px;border-radius:6px;max-width:100%}
 <p><small>Market refresh: 20 seconds</small></p><p id="updated"></p>
 
 <script>
+const escapeHTML = value => String(value ?? "").replace(/[&<>\"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;", "'":"&#39;"}[ch]));
 const STOCKS = {{ stocks_json|safe }};
 async function updateMarket(){
  try{
   let r=await fetch("/api/market"),d=await r.json();if(!r.ok)throw Error(d.error||"Market API Error");
   for(let name of ["NIFTY 50","SENSEX"]){let x=d[name],id=name==="NIFTY 50"?"nifty":"sensex";if(!x)continue;
    let ch=x.price-x.close,p=x.close?ch/x.close*100:0;
-   document.getElementById(id).innerHTML=x.price.toLocaleString("en-IN")+"<br><small>"+ch.toFixed(2)+" ("+p.toFixed(2)+"%)</small>";}
+   document.getElementById(id).textContent=x.price.toLocaleString("en-IN")+" | "+ch.toFixed(2)+" ("+p.toFixed(2)+"%)";}
   document.getElementById("updated").innerText="Last updated: "+new Date().toLocaleTimeString();
  }catch(e){console.log(e.message);}
 }
@@ -305,22 +361,22 @@ async function scanSwing(){
  let s=document.getElementById("scanStatus"),t=document.getElementById("scanner");s.innerText="Scanning 50 stocks...";
  try{let r=await fetch("/api/scanner"),d=await r.json();if(!r.ok)throw Error(d.error||"Scanner failed");t.innerHTML="";
  (d.results||[]).forEach(x=>{let c=x.signal==="BULLISH WATCH"?"green":x.signal==="BEARISH WATCH"?"red":"";
- t.innerHTML+=`<tr><td>${x.stock}</td><td>${x.price}</td><td>${x.rsi}</td><td>${x.support}</td><td>${x.resistance}</td><td class="${c}">${x.signal}</td></tr>`;});
+ t.innerHTML+=`<tr><td>${escapeHTML(x.stock)}</td><td>${escapeHTML(x.price)}</td><td>${escapeHTML(x.rsi)}</td><td>${escapeHTML(x.support)}</td><td>${escapeHTML(x.resistance)}</td><td class="${c}">${escapeHTML(x.signal)}</td></tr>`;});
  s.innerText=`Completed: ${d.results.length}/50 | Errors: ${(d.errors||[]).length}`;
  }catch(e){s.innerText=e.message;}}
 function miniTable(rows){if(!rows.length)return "<p>No qualifying rows.</p>";
  return `<div style="overflow-x:auto"><table><tr><th>Stock</th><th>Price</th><th>ADX</th><th>+DI</th><th>-DI</th><th>Bull</th><th>Bear</th><th>Signal</th></tr>`+
- rows.map(x=>`<tr><td>${x.symbol}</td><td>${x.price??"-"}</td><td>${x.adx14??"-"}</td><td>${x.plus_di14??"-"}</td><td>${x.minus_di14??"-"}</td><td>${x.bull_score??"-"}</td><td>${x.bear_score??"-"}</td><td>${x.signal||"-"}</td></tr>`).join("")+"</table></div>";}
+ rows.map(x=>`<tr><td>${escapeHTML(x.symbol)}</td><td>${escapeHTML(x.price??"-")}</td><td>${escapeHTML(x.adx14??"-")}</td><td>${escapeHTML(x.plus_di14??"-")}</td><td>${escapeHTML(x.minus_di14??"-")}</td><td>${escapeHTML(x.bull_score??"-")}</td><td>${escapeHTML(x.bear_score??"-")}</td><td>${escapeHTML(x.signal||"-")}</td></tr>`).join("")+"</table></div>";}
 async function runAdvancedScanner(){
  let s=document.getElementById("advancedStatus"),t=document.getElementById("advancedRows"),e=document.getElementById("advancedErrors");
  s.innerText="Scanning all 50 NIFTY stocks... please wait.";t.innerHTML="";e.innerText="";
  document.getElementById("topBullish").innerHTML="";document.getElementById("topBearish").innerHTML="";
  try{let r=await fetch("/api/advanced-scan"),d=await r.json();if(!r.ok)throw Error(d.error||"Advanced scan failed");
  let rows=d.results||[];rows.forEach(x=>{let c=(x.signal||"").includes("BULLISH")?"green":(x.signal||"").includes("BEARISH")?"red":"";
- t.innerHTML+=`<tr><td>${x.symbol||"-"}</td><td>${x.intraday_price_5m??x.price??"-"}</td><td>${x.rsi14??"-"}</td>
- <td>${x.adx14??"-"}</td><td>${x.plus_di14??"-"}</td><td>${x.minus_di14??"-"}</td>
- <td>${x.volume_ratio??"-"}</td><td>${x.vwap_5m??"-"}</td><td>${x.bull_score??"-"}</td><td>${x.bear_score??"-"}</td>
- <td class="${c}">${x.signal||x.status||"-"}</td></tr>`;});
+ t.innerHTML+=`<tr><td>${escapeHTML(x.symbol||"-")}</td><td>${escapeHTML(x.intraday_price_5m??x.price??"-")}</td><td>${escapeHTML(x.rsi14??"-")}</td>
+ <td>${escapeHTML(x.adx14??"-")}</td><td>${escapeHTML(x.plus_di14??"-")}</td><td>${escapeHTML(x.minus_di14??"-")}</td>
+ <td>${escapeHTML(x.volume_ratio??"-")}</td><td>${escapeHTML(x.vwap_5m??"-")}</td><td>${escapeHTML(x.bull_score??"-")}</td><td>${escapeHTML(x.bear_score??"-")}</td>
+ <td class="${c}">${escapeHTML(x.signal||x.status||"-")}</td></tr>`;});
  let bulls=rows.filter(x=>(x.signal||"").includes("BULLISH")).sort((a,b)=>(b.bull_score||0)-(a.bull_score||0)).slice(0,5);
  let bears=rows.filter(x=>(x.signal||"").includes("BEARISH")).sort((a,b)=>(b.bear_score||0)-(a.bear_score||0)).slice(0,5);
  document.getElementById("topBullish").innerHTML=miniTable(bulls);document.getElementById("topBearish").innerHTML=miniTable(bears);
@@ -332,29 +388,29 @@ async function runAISignal(){
  s.innerText="Analyzing "+u+"...";o.innerHTML="";
  try{let r=await fetch("/api/ai-signal/"+encodeURIComponent(u)),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"Signal failed");
  s.innerText="Analysis complete"+(d.telegram_alert_sent?" | Telegram alert sent":" | Telegram alert not sent");
- o.innerHTML=`<h2>${d.signal||"WAIT"}</h2><p>Spot: ${d.spot??"-"} | Expiry: ${d.expiry??"-"} | ATM: ${d.atm_strike??"-"}</p>
- <p>ATM CE: ${d.atm_ce_symbol??"-"} (${d.atm_ce_ltp??"-"}) | ATM PE: ${d.atm_pe_symbol??"-"} (${d.atm_pe_ltp??"-"})</p>
- <p>Signal option: ${d.option_symbol??"-"} | LTP: ${d.option_ltp??"-"}</p>
- <p>RSI: ${d.rsi14??"-"} | EMA9: ${d.ema9??"-"} | EMA21: ${d.ema21??"-"} | PCR: ${d.pcr??"-"}</p>
- <p>Technical: ${d.technical_bias??"-"} | OI: ${d.oi_bias??"-"} | Support: ${d.support??"-"} | Resistance: ${d.resistance??"-"}</p>
- <p>Hilega: ${d.hilega_confirmation??"-"} | Bull: ${d.bull_score??"-"} | Bear: ${d.bear_score??"-"}</p><hr>
- <h3>Paper Plan (illustrative)</h3><p>Confidence score: ${d.confidence_score??"-"}/100</p>
- <p>Entry: ${d.entry_zone_low??"-"} to ${d.entry_zone_high??"-"} | SL: ${d.stop_loss??"-"}</p>
- <p>T1: ${d.target1??"-"} | T2: ${d.target2??"-"}</p><p>${d.plan_note||""}</p><p>${d.note||d.reason||""}</p>`;
+ o.innerHTML=`<h2>${escapeHTML(d.signal||"WAIT")}</h2><p>Spot: ${escapeHTML(d.spot??"-")} | Expiry: ${escapeHTML(d.expiry??"-")} | ATM: ${escapeHTML(d.atm_strike??"-")}</p>
+ <p>ATM CE: ${escapeHTML(d.atm_ce_symbol??"-")} (${escapeHTML(d.atm_ce_ltp??"-")}) | ATM PE: ${escapeHTML(d.atm_pe_symbol??"-")} (${escapeHTML(d.atm_pe_ltp??"-")})</p>
+ <p>Signal option: ${escapeHTML(d.option_symbol??"-")} | LTP: ${escapeHTML(d.option_ltp??"-")}</p>
+ <p>RSI: ${escapeHTML(d.rsi14??"-")} | EMA9: ${escapeHTML(d.ema9??"-")} | EMA21: ${escapeHTML(d.ema21??"-")} | PCR: ${escapeHTML(d.pcr??"-")}</p>
+ <p>Technical: ${escapeHTML(d.technical_bias??"-")} | OI: ${escapeHTML(d.oi_bias??"-")} | Support: ${escapeHTML(d.support??"-")} | Resistance: ${escapeHTML(d.resistance??"-")}</p>
+ <p>Hilega: ${escapeHTML(d.hilega_confirmation??"-")} | Bull: ${escapeHTML(d.bull_score??"-")} | Bear: ${escapeHTML(d.bear_score??"-")}</p><hr>
+ <h3>Paper Plan (illustrative)</h3><p>Confidence score: ${escapeHTML(d.confidence_score??"-")}/100</p>
+ <p>Entry: ${escapeHTML(d.entry_zone_low??"-")} to ${escapeHTML(d.entry_zone_high??"-")} | SL: ${escapeHTML(d.stop_loss??"-")}</p>
+ <p>T1: ${escapeHTML(d.target1??"-")} | T2: ${escapeHTML(d.target2??"-")}</p><p>${escapeHTML(d.plan_note||"")}</p><p>${escapeHTML(d.note||d.reason||"")}</p>`;
  }catch(e){s.innerText="Error: "+e.message;}}
-function chainHtml(d){return `<h3>Spot: ${d.spot_price}</h3><h3>ATM: ${d.atm_strike}</h3><p>Expiry: ${d.expiry}</p>
- <p>PCR: ${d.pcr} | Max Pain: ${d.max_pain}</p><p>Support: ${d.support??"-"} | Resistance: ${d.resistance??"-"}</p>
- <p>Total CE OI: ${d.total_ce_oi} | Total PE OI: ${d.total_pe_oi}</p><div style="overflow-x:auto"><table><tr><th>CE OI</th><th>CE LTP</th><th>Strike</th><th>PE LTP</th><th>PE OI</th></tr>
- ${(d.option_chain||[]).map(x=>`<tr><td>${x.CE?.oi??"-"}</td><td>${x.CE?.ltp??"-"}</td><td>${x.strike}</td><td>${x.PE?.ltp??"-"}</td><td>${x.PE?.oi??"-"}</td></tr>`).join("")}</table></div>`;}
+function chainHtml(d){return `<h3>Spot: ${escapeHTML(d.spot_price)}</h3><h3>ATM: ${escapeHTML(d.atm_strike)}</h3><p>Expiry: ${escapeHTML(d.expiry)}</p>
+ <p>PCR: ${escapeHTML(d.pcr)} | Max Pain: ${escapeHTML(d.max_pain)}</p><p>Support: ${escapeHTML(d.support??"-")} | Resistance: ${escapeHTML(d.resistance??"-")}</p>
+ <p>Total CE OI: ${escapeHTML(d.total_ce_oi)} | Total PE OI: ${escapeHTML(d.total_pe_oi)}</p><div style="overflow-x:auto"><table><tr><th>CE OI</th><th>CE LTP</th><th>Strike</th><th>PE LTP</th><th>PE OI</th></tr>
+ ${(d.option_chain||[]).map(x=>`<tr><td>${escapeHTML(x.CE?.oi??"-")}</td><td>${escapeHTML(x.CE?.ltp??"-")}</td><td>${escapeHTML(x.strike)}</td><td>${escapeHTML(x.PE?.ltp??"-")}</td><td>${escapeHTML(x.PE?.oi??"-")}</td></tr>`).join("")}</table></div>`;}
 async function loadOptions(){let u=document.getElementById("underlying").value,s=document.getElementById("optionStatus"),o=document.getElementById("optionResult");
  s.innerText="Loading...";try{let r=await fetch("/api/options/"+u),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API error");s.innerText=u+" option chain";o.innerHTML=chainHtml(d);}catch(e){s.innerText="Error: "+e.message;}}
 let lastHilegaRows=[];
 async function loadHilega(){let s=document.getElementById("hilegaStatus"),t=document.getElementById("hilegaRows");s.innerText="Scanning NIFTY 50 in 5 batches...";t.innerHTML="";
  let all=[],count=0;try{for(let b=0;b<5;b++){s.innerText=`Scanning batch ${b+1}/5...`;let r=await fetch(`/api/hilega?batch=${b}`),d=await r.json();if(!r.ok)throw Error(d.error||"Hilega batch failed");all=all.concat(d.results||[]);count+=d.scanned||0;}
- lastHilegaRows=all;all.forEach(x=>{t.innerHTML+=`<tr><td>${x.symbol}</td><td>${x.close}</td><td>${x.rsi}</td><td>${x.entry}</td><td>${x.stop_loss}</td><td>${x.target1}</td><td>${x.target2}</td><td class="green">${x.signal}</td></tr>`;});
+ lastHilegaRows=all;all.forEach(x=>{t.innerHTML+=`<tr><td>${escapeHTML(x.symbol)}</td><td>${escapeHTML(x.close)}</td><td>${escapeHTML(x.rsi)}</td><td>${escapeHTML(x.entry)}</td><td>${escapeHTML(x.stop_loss)}</td><td>${escapeHTML(x.target1)}</td><td>${escapeHTML(x.target2)}</td><td class="green">${escapeHTML(x.signal)}</td></tr>`;});
  s.innerText=`Complete: ${count} checked, ${all.length} BUY WATCH candidates.`;}catch(e){s.innerText="Error: "+e.message;}}
 async function sendHilegaAlerts(){let s=document.getElementById("hilegaStatus");try{if(!lastHilegaRows.length)throw Error("Run Hilega scan first.");
- let r=await fetch("/api/hilega/telegram",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({results:lastHilegaRows})});
+ let r=await fetch("/api/hilega/telegram",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":document.querySelector('meta[name="csrf-token"]').content},body:JSON.stringify({results:lastHilegaRows})});
  let d=await r.json();if(!r.ok)throw Error(d.error||"Telegram failed");s.innerText=d.message;}catch(e){s.innerText="Error: "+e.message;}}
 async function loadStockOptions(){let sym=document.getElementById("stockOptionSymbol").value.trim().toUpperCase(),s=document.getElementById("stockOptionStatus"),o=document.getElementById("stockOptionResult");
  if(!sym){s.innerText="Enter a symbol.";return;}s.innerText="Loading "+sym+"...";try{let r=await fetch("/api/stock-options/"+encodeURIComponent(sym)),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API error");s.innerText=sym+" option chain";o.innerHTML=chainHtml(d);}catch(e){s.innerText="Error: "+e.message;}}
@@ -414,11 +470,11 @@ function renderJournal(){
  body.innerHTML="";
  rows.forEach(x=>{
   const pnl=x.pnl===null?"-":("₹"+Number(x.pnl).toFixed(2));
-  body.innerHTML+=`<tr><td>${x.date}</td><td>${x.type}</td><td>${x.symbol}</td><td>${x.option??"-"}</td>
-  <td>${x.expiry??"-"}</td><td>${x.strike??"-"}</td><td>${x.side}</td><td>${x.entry}</td><td>${x.sl}</td>
-  <td>${x.t1}</td><td>${x.t2}</td><td>${x.qty}</td><td>${x.type==="OPTIONS"?(x.lotSize??1):"-"}</td>
-  <td>${x.state}</td><td>${x.exit??"-"}</td><td>${pnl}</td>
-  <td>${x.state==="OPEN"?`<button onclick="closePaperTrade(${x.id})">Close</button>`:"-"}</td></tr>`;
+  body.innerHTML+=`<tr><td>${escapeHTML(x.date)}</td><td>${escapeHTML(x.type)}</td><td>${escapeHTML(x.symbol)}</td><td>${escapeHTML(x.option??"-")}</td>
+  <td>${escapeHTML(x.expiry??"-")}</td><td>${escapeHTML(x.strike??"-")}</td><td>${escapeHTML(x.side)}</td><td>${escapeHTML(x.entry)}</td><td>${escapeHTML(x.sl)}</td>
+  <td>${escapeHTML(x.t1)}</td><td>${escapeHTML(x.t2)}</td><td>${escapeHTML(x.qty)}</td><td>${escapeHTML(x.type==="OPTIONS"?(x.lotSize??1):"-")}</td>
+  <td>${escapeHTML(x.state)}</td><td>${escapeHTML(x.exit??"-")}</td><td>${pnl}</td>
+  <td>${x.state==="OPEN"?`<button onclick="closePaperTrade(${Number.isSafeInteger(Number(x.id)) ? Number(x.id) : 0})">Close</button>`:"-"}</td></tr>`;
  });
  const closed=rows.filter(x=>x.state==="CLOSED"),total=closed.reduce((s,x)=>s+(Number(x.pnl)||0),0);
  const wins=closed.filter(x=>x.pnl>0).length;
@@ -445,7 +501,7 @@ updateMarket();setInterval(updateMarket,20000);
 loadSummary();
 </script></body></html>
 """, stock_options=stock_options, stocks_json=__import__("json").dumps(STOCKS),
-       capital=PAPER_CAPITAL, risk=PAPER_RISK_PER_TRADE,
+       csrf_token=csrf_token, capital=PAPER_CAPITAL, risk=PAPER_RISK_PER_TRADE,
        daily_limit=PAPER_DAILY_LOSS_LIMIT)
 
 
@@ -466,6 +522,11 @@ def callback():
         data = kite.generate_session(token, api_secret=API_SECRET)
         ACCESS_TOKEN = data["access_token"]
         kite.set_access_token(ACCESS_TOKEN)
+        session.clear()
+        session["authenticated"] = True
+        session["token_fingerprint"] = hashlib.sha256(ACCESS_TOKEN.encode()).hexdigest()
+        session["csrf_token"] = secrets.token_urlsafe(32)
+        session.permanent = True
         return redirect("/")
     except Exception as exc:
         print("Authentication error:", repr(exc))
@@ -473,6 +534,7 @@ def callback():
 
 
 @app.route("/api/market")
+@login_required
 def market():
     if not logged_in():
         return jsonify({"error": "Please login with Zerodha"}), 401
@@ -490,24 +552,27 @@ def market():
 
 
 @app.route("/api/market-summary")
+@login_required
 def market_summary():
     try:
         return jsonify({"status": "success", "market_summary": market_summary_data(),
                         "updated": datetime.now().isoformat()})
     except Exception as exc:
-        return jsonify({"status": "error", "error": str(exc)}), 500
+        return jsonify({"status": "error", "error": "Market summary unavailable"}), 500
 
 
 @app.route("/api/scanner")
+@login_required
 def scanner():
     try:
         rows, errors = scan_stocks()
         return jsonify({"results": rows, "errors": errors, "updated": datetime.now().isoformat()})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
+        return jsonify({"error": "Request failed. Check server logs."}), 502
 
 
 @app.route("/api/advanced-scan")
+@login_required
 def advanced_scan_api():
     if not logged_in():
         return jsonify({"error": "Please login with Zerodha"}), 401
@@ -521,6 +586,7 @@ def advanced_scan_api():
 
 
 @app.route("/api/hilega")
+@login_required
 def hilega_api():
     try:
         batch = int(request.args.get("batch", "0"))
@@ -545,10 +611,11 @@ def hilega_api():
         })
     except Exception as exc:
         print("Hilega API error:", repr(exc))
-        return jsonify({"error": str(exc)}), 502
+        return jsonify({"error": "Request failed. Check server logs."}), 502
 
 
 @app.route("/api/hilega/telegram", methods=["POST"])
+@login_required
 def hilega_telegram():
     try:
         payload = request.get_json(silent=True) or {}
@@ -558,8 +625,18 @@ def hilega_telegram():
         safe_rows = []
         required = ("symbol", "close", "rsi", "stop_loss", "target1", "target2")
         for item in rows[:20]:
-            if isinstance(item, dict) and all(key in item for key in required):
-                safe_rows.append(item)
+            if not isinstance(item, dict) or not all(key in item for key in required):
+                continue
+            symbol = str(item.get("symbol", "")).upper()
+            if symbol not in STOCKS:
+                continue
+            try:
+                numeric = {key: float(item[key]) for key in ("close", "rsi", "stop_loss", "target1", "target2")}
+            except (TypeError, ValueError):
+                continue
+            if not all(__import__("math").isfinite(value) for value in numeric.values()):
+                continue
+            safe_rows.append({"symbol": symbol, **numeric})
         if not safe_rows:
             return jsonify({"message": "No BUY candidates; no Telegram alert sent."})
         lines = ["HILEGA MILEGA — NIFTY 50", "Research alerts only:"]
@@ -573,10 +650,11 @@ def hilega_telegram():
         return jsonify({"message": f"Telegram alert sent for {len(safe_rows)} candidate(s)."})
     except Exception as exc:
         print("Hilega Telegram error:", repr(exc))
-        return jsonify({"error": str(exc)}), 502
+        return jsonify({"error": "Request failed. Check server logs."}), 502
 
 
 @app.route("/api/ai-signal/<underlying>")
+@login_required
 def ai_signal_api(underlying):
     if not logged_in():
         return jsonify({"error": "Please login with Zerodha"}), 401
@@ -658,10 +736,11 @@ def ai_signal_api(underlying):
         return jsonify(result)
     except Exception as exc:
         print("AI Signal API error:", repr(exc))
-        return jsonify({"error": str(exc)}), 502
+        return jsonify({"error": "Request failed. Check server logs."}), 502
 
 
 @app.route("/api/options/<underlying>")
+@login_required
 def options_api(underlying):
     if not logged_in():
         return jsonify({"error": "Please login with Zerodha"}), 401
@@ -673,10 +752,11 @@ def options_api(underlying):
         spot = kite.ltp(key)[key]["last_price"]
         return jsonify(get_option_analysis(kite, underlying, spot))
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
+        return jsonify({"error": "Request failed. Check server logs."}), 502
 
 
 @app.route("/api/stock-options/<symbol>")
+@login_required
 def stock_options_api(symbol):
     if not logged_in():
         return jsonify({"error": "Please login with Zerodha"}), 401
@@ -691,16 +771,71 @@ def stock_options_api(symbol):
             return jsonify(result), 404
         return jsonify(result)
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
+        return jsonify({"error": "Request failed. Check server logs."}), 502
 
 
-@app.route("/test-telegram")
+@app.route("/test-telegram", methods=["POST"])
+@login_required
 def test_telegram():
     if not ACCESS_TOKEN:
         return "Please login with Zerodha first", 401
     if send_telegram("Trading AI Dashboard: Telegram connection successful!"):
         return "Telegram Test Alert Sent Successfully!"
     return "Telegram Alert Failed. Check Render Environment Variables.", 500
+
+
+@app.route("/logout", methods=["POST"])
+@login_required
+def logout():
+    session.clear()
+    return jsonify({"status": "logged_out"})
+
+
+@app.route("/api/execution/status")
+@login_required
+def execution_status():
+    """Authenticated read-only status; live order submission remains hard-disabled."""
+    return jsonify({
+        "live_execution_enabled": False,
+        "broker_order_submission": "HARD_BLOCKED",
+        "kill_switch": get_guard_state(EXECUTION_DB_PATH),
+        "intent_count": len(get_order_intents(db_path=EXECUTION_DB_PATH, limit=500)),
+        "exit_watch_count": len(list_exit_watches(db_path=EXECUTION_DB_PATH)),
+    })
+
+
+@app.route("/api/execution/reconcile", methods=["POST"])
+@login_required
+def execution_reconcile():
+    """Read Zerodha orders/positions; any mismatch or API failure halts execution."""
+    if not kite or not ACCESS_TOKEN:
+        return jsonify({"ok": False, "error": "Zerodha session unavailable", "broker_order_placed": False}), 401
+    try:
+        result = reconcile_broker_state(kite, db_path=EXECUTION_DB_PATH)
+        if not result.get("ok"):
+            set_kill_switch(True, "RECONCILIATION_MISMATCH", EXECUTION_DB_PATH)
+        return jsonify(result)
+    except Exception as exc:
+        # Fail closed: do not expose broker exception details to the browser.
+        set_kill_switch(True, "BROKER_RECONCILIATION_FAILED", EXECUTION_DB_PATH)
+        print("Broker reconciliation failed:", repr(exc))
+        return jsonify({"ok": False, "error": "Broker reconciliation failed; kill switch engaged",
+                        "kill_switch": get_guard_state(EXECUTION_DB_PATH),
+                        "broker_order_placed": False}), 502
+
+
+@app.route("/api/execution/intents")
+@login_required
+def execution_intents():
+    return jsonify({"items": get_order_intents(db_path=EXECUTION_DB_PATH, limit=100),
+                    "broker_order_placed": False})
+
+
+@app.route("/api/execution/exit-watches")
+@login_required
+def execution_exit_watches():
+    return jsonify({"items": list_exit_watches(db_path=EXECUTION_DB_PATH),
+                    "broker_order_placed": False})
 
 
 @app.route("/health")

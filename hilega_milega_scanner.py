@@ -1,97 +1,135 @@
+"""Hilega Milega research scanner (15m, completed candles only).
+
+Documented approximation based on public descriptions: RSI(9), EMA(3) of RSI,
+WMA(21) of RSI. Not exact Chartink parity or a copy of protected source code.
+Uses Yahoo Finance via yfinance; data may be delayed/incomplete.
+"""
+from __future__ import annotations
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import logging, math
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-NIFTY50 = [
-    "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK",
-    "BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV","BEL","BHARTIARTL",
-    "CIPLA","COALINDIA","DRREDDY","EICHERMOT","ETERNAL","GRASIM",
-    "HCLTECH","HDFCBANK","HDFCLIFE","HEROMOTOCO","HINDALCO",
-    "HINDUNILVR","ICICIBANK","INDUSINDBK","INFY","ITC","JIOFIN",
-    "JSWSTEEL","KOTAKBANK","LT","M&M","MARUTI","NESTLEIND","NTPC",
-    "ONGC","POWERGRID","RELIANCE","SBILIFE","SBIN","SHRIRAMFIN",
-    "SUNPHARMA","TATACONSUM","TATASTEEL","TCS","TECHM","TITAN",
-    "TRENT","ULTRACEMCO","WIPRO"
+IST = ZoneInfo('Asia/Kolkata')
+LOG = logging.getLogger(__name__)
+INTERVAL, PERIOD = '15m', '60d'
+RSI_LEN, EMA_LEN, WMA_LEN, PRICE_EMA_LEN, ATR_LEN = 9, 3, 21, 20, 14
+MIN_BARS = 80
+SYMBOLS = [
+    'ADANIENT','ADANIPORTS','APOLLOHOSP','ASIANPAINT','AXISBANK','BAJAJ-AUTO',
+    'BAJFINANCE','BAJAJFINSV','BEL','BHARTIARTL','CIPLA','COALINDIA','DRREDDY',
+    'EICHERMOT','ETERNAL','GRASIM','HCLTECH','HDFCBANK','HDFCLIFE','HINDALCO',
+    'HINDUNILVR','ICICIBANK','ITC','INFY','INDIGO','JSWSTEEL','JIOFIN','KOTAKBANK',
+    'LT','MARUTI','MAXHEALTH','NTPC','NESTLEIND','ONGC','POWERGRID','RELIANCE',
+    'SBILIFE','SHRIRAMFIN','SBIN','SUNPHARMA','TCS','TATACONSUM','TATASTEEL',
+    'TECHM','TITAN','TRENT','ULTRACEMCO'
 ]
-PERIOD = 9
-VOLUME_MIN = 50000
 
-def _col(df, name):
-    s = df[name]
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-    return s.dropna().astype(float)
+def _ticker_symbol(symbol: str) -> str:
+    s = str(symbol).upper().strip()
+    if not s: raise ValueError('Empty symbol')
+    return s.replace('&', '%26') + '.NS'
 
-def _rsi(close, period=PERIOD):
-    delta = close.diff()
-    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
-    ag = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    al = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+def _normalise(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty: raise ValueError('No market data returned')
+    if isinstance(raw.columns, pd.MultiIndex): raw.columns = raw.columns.get_level_values(0)
+    raw.columns = [str(c).strip().lower().replace(' ', '_') for c in raw.columns]
+    cols = ['open','high','low','close','volume']
+    if not set(cols).issubset(raw.columns): raise ValueError('Missing OHLCV columns')
+    df = raw[cols].copy()
+    for c in cols: df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df.dropna(subset=['open','high','low','close']).loc[lambda x: ~x.index.duplicated(keep='last')].sort_index()
+
+def _completed_15m(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    ts = pd.Timestamp(df.index[-1])
+    ts = ts.tz_localize(IST) if ts.tzinfo is None else ts.tz_convert(IST)
+    now = pd.Timestamp.now(tz=IST)
+    # Yahoo timestamps mark candle start. Do not use the forming candle.
+    return df.iloc[:-1].copy() if ts + pd.Timedelta(minutes=15) > now else df
+
+def _rsi(close: pd.Series, n: int = RSI_LEN) -> pd.Series:
+    d = close.diff(); gain = d.clip(lower=0); loss = -d.clip(upper=0)
+    ag = gain.ewm(alpha=1/n, min_periods=n, adjust=False).mean()
+    al = loss.ewm(alpha=1/n, min_periods=n, adjust=False).mean()
     rs = ag / al.replace(0, np.nan)
-    result = 100 - 100/(1+rs)
-    result = result.mask((al == 0) & (ag > 0), 100)
-    result = result.mask((ag == 0) & (al > 0), 0)
-    return result
+    out = 100 - 100/(1+rs)
+    out = out.mask((al == 0) & (ag > 0), 100).mask((ag == 0) & (al > 0), 0)
+    return out
 
-def _wma(s, period=PERIOD):
-    weights = np.arange(1, period+1, dtype=float)
-    return s.rolling(period).apply(lambda x: float(np.dot(x, weights)/weights.sum()), raw=True)
+def _wma(s: pd.Series, n: int = WMA_LEN) -> pd.Series:
+    weights = np.arange(1, n+1, dtype=float)
+    return s.rolling(n, min_periods=n).apply(lambda x: float(np.dot(x, weights)/weights.sum()), raw=True)
 
-def _ema(s, period=PERIOD):
-    return s.ewm(span=period, adjust=False, min_periods=period).mean()
+def _atr(df: pd.DataFrame) -> pd.Series:
+    pc = df.close.shift(1)
+    tr = pd.concat([df.high-df.low, (df.high-pc).abs(), (df.low-pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/ATR_LEN, min_periods=ATR_LEN, adjust=False).mean()
 
-def scan(symbol):
-    ticker = symbol + ".NS"
-    d = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
-    w = yf.download(ticker, period="2y", interval="1wk", progress=False, auto_adjust=True)
-    m = yf.download(ticker, period="5y", interval="1mo", progress=False, auto_adjust=True)
-    if d.empty or w.empty or m.empty:
-        return None
-    dc, wc, mc = _col(d,"Close"), _col(w,"Close"), _col(m,"Close")
-    vol = _col(d,"Volume")
-    if min(len(dc),len(wc),len(mc)) < 20 or len(vol) < 2:
-        return None
-    dr, wr, mr = _rsi(dc), _rsi(wc), _rsi(mc)
-    de, dw, we, ww, mw = _ema(dr), _wma(dr), _ema(wr), _wma(wr), _wma(mr)
-    series = [dr,de,dw,we,ww,mw]
-    if any(x.dropna().empty for x in series):
-        return None
-    close, prev, volume = float(dc.iloc[-1]), float(dc.iloc[-2]), int(vol.iloc[-1])
-    checks = [
-        float(dr.iloc[-1]) > 50,
-        float(mw.iloc[-1]) < 50,
-        float(ww.iloc[-1]) < 50,
-        float(we.iloc[-1]) > float(ww.iloc[-1]),
-        float(de.iloc[-1]) > float(dw.iloc[-1]),
-        close > prev,
-        volume > VOLUME_MIN,
-    ]
-    if not all(checks):
-        return None
+def _trend_30m(df: pd.DataFrame) -> str:
+    x = df.resample('30min', label='right', closed='right').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna(subset=['close'])
+    if len(x): x = x.iloc[:-1]  # only completed 30m bars
+    if len(x) < 25: return 'INSUFFICIENT'
+    ema = x.close.ewm(span=PRICE_EMA_LEN, adjust=False).mean()
+    return 'BULLISH' if x.close.iloc[-1] > ema.iloc[-1] else ('BEARISH' if x.close.iloc[-1] < ema.iloc[-1] else 'NEUTRAL')
 
-    high, low = _col(d,"High"), _col(d,"Low")
-    prev_close = dc.shift(1)
-    tr = pd.concat([(high-low),(high-prev_close).abs(),(low-prev_close).abs()],axis=1).max(axis=1)
-    atr = float(tr.rolling(14).mean().iloc[-1])
-    if not np.isfinite(atr) or atr <= 0:
-        atr = close * 0.02
-    sl = round(close-atr,2)
-    risk = max(close-sl, close*0.005)
+def analyze_frame(raw: pd.DataFrame, symbol: str) -> dict:
+    df = _completed_15m(_normalise(raw))
+    if len(df) < MIN_BARS: raise ValueError(f'Need {MIN_BARS} completed 15m candles; got {len(df)}')
+    close = df.close
+    rsi = _rsi(close)
+    ema_rsi = rsi.ewm(span=EMA_LEN, adjust=False, min_periods=EMA_LEN).mean()
+    wma_rsi = _wma(rsi)
+    ema20 = close.ewm(span=PRICE_EMA_LEN, adjust=False).mean()
+    atr = _atr(df)
+    # Session VWAP resets for each trading date.
+    session = pd.Series(df.index.date, index=df.index)
+    typical = (df.high + df.low + df.close)/3
+    volume = df.volume.fillna(0).clip(lower=0)
+    vwap = (typical*volume).groupby(session).cumsum() / volume.groupby(session).cumsum().replace(0, np.nan)
+    ind = pd.DataFrame({'rsi':rsi,'ema_rsi':ema_rsi,'wma_rsi':wma_rsi,'ema20':ema20,'atr':atr,'vwap':vwap}).dropna()
+    if len(ind) < 2: raise ValueError('Insufficient valid indicator values')
+    prev, cur = ind.iloc[-2], ind.iloc[-1]
+    price = float(close.loc[ind.index[-1]])
+    cross_up = prev.rsi <= prev.wma_rsi and cur.rsi > cur.wma_rsi
+    cross_down = prev.rsi >= prev.wma_rsi and cur.rsi < cur.wma_rsi
+    buy_ok = cur.rsi > 50 and cur.ema_rsi > cur.wma_rsi and price > cur.ema20 and price > cur.vwap
+    sell_ok = cur.rsi < 50 and cur.ema_rsi < cur.wma_rsi and price < cur.ema20 and price < cur.vwap
+    signal, reason = '-', 'No fresh RSI/WMA crossover on the last completed candle.'
+    if cross_up and buy_ok: signal, reason = 'BUY WATCH', 'Bullish RSI/WMA cross with RSI>50, EMA3>WMA21, price>EMA20 and VWAP.'
+    elif cross_down and sell_ok: signal, reason = 'SELL WATCH', 'Bearish RSI/WMA cross with RSI<50, EMA3<WMA21, price<EMA20 and VWAP.'
+    elif cross_up: reason = 'Bullish cross, but one or more confirmation filters failed.'
+    elif cross_down: reason = 'Bearish cross, but one or more confirmation filters failed.'
+    a = float(cur.atr); sl=t1=t2=None
+    if math.isfinite(a) and a > 0 and signal == 'BUY WATCH': sl,t1,t2 = round(price-1.5*a,2),round(price+1.5*a,2),round(price+3*a,2)
+    elif math.isfinite(a) and a > 0 and signal == 'SELL WATCH': sl,t1,t2 = round(price+1.5*a,2),round(price-1.5*a,2),round(price-3*a,2)
     return {
-        "symbol": symbol, "signal": "BUY WATCH", "close": round(close,2),
-        "rsi": round(float(dr.iloc[-1]),2), "volume": volume,
-        "entry": round(close,2), "stop_loss": sl,
-        "target1": round(close+risk*1.5,2), "target2": round(close+risk*2,2),
-        "risk_reward_t1": "1:1.5", "risk_reward_t2": "1:2"
+        'symbol':str(symbol).upper(),'signal':signal,'close':round(price,2),
+        'rsi':round(float(cur.rsi),2),'ema_rsi_3':round(float(cur.ema_rsi),2),
+        'wma_rsi_21':round(float(cur.wma_rsi),2),'ema20':round(float(cur.ema20),2),
+        'vwap':round(float(cur.vwap),2),'atr14':round(a,2),
+        'stop_loss':sl,'target1':t1,'target2':t2,
+        'trend_15m':'BULLISH' if price>cur.ema20 else 'BEARISH',
+        'trend_30m':_trend_30m(df),'as_of':pd.Timestamp(ind.index[-1]).isoformat(),
+        'reason':reason,'data_interval':'15m','candle_closed':True,
+        'method':'Approximation: RSI9/WMA21 cross + EMA3 RSI and price/EMA20/VWAP filters'
     }
 
-def scan_all():
-    found=[]
-    for symbol in NIFTY50:
-        try:
-            result=scan(symbol)
-            if result:
-                found.append(result)
+def scan(symbol: str):
+    raw = yf.Ticker(_ticker_symbol(symbol)).history(period=PERIOD, interval=INTERVAL, auto_adjust=False, actions=False, prepost=False, timeout=20)
+    return analyze_frame(raw, symbol)
+
+def scan_many(symbols=None) -> dict:
+    symbols = list(symbols or SYMBOLS); results=[]; errors=[]
+    for symbol in symbols:
+        try: results.append(scan(symbol))
         except Exception as exc:
-            print(f"Scanner skipped {symbol}: {exc}")
-    return found
+            LOG.warning('Hilega scan failed for %s: %s', symbol, exc)
+            errors.append({'symbol':symbol,'error':str(exc)})
+    return {'results':results,'scanned':len(symbols),'matched':sum(x['signal']!='-' for x in results),'errors':errors,'updated':datetime.now(IST).isoformat(),'note':'Research/paper only. Yahoo data may be delayed/incomplete; not exact Chartink parity.'}
+
+if __name__ == '__main__':
+    import json
+    print(json.dumps(scan_many(SYMBOLS[:5]), indent=2, default=str))

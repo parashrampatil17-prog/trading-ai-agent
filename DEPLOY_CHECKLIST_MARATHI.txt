@@ -1,0 +1,41 @@
+TRADING AI - COMPLETE STAGING PACKAGE
+
+ही ZIP स्वतंत्र STAGING / TEST package आहे. Production service overwrite करू नका.
+
+पॅकेजमध्ये app.py आणि त्याचे सर्व local Python modules आहेत:
+- advanced_scanner.py
+- hilega_milega_scanner.py
+- signal_engine.py
+- options_engine.py / options_engine_v2.py
+- live_order_manager.py
+- broker_reconciliation.py
+- auto_execution_guard.py
+
+महत्त्वाचे सुरक्षा मुद्दे:
+1) Live order submission hard-blocked आहे. kite.place_order/modify_order/cancel_order कॉल नाही.
+2) TRADING_AI_LIVE_ENABLED=true असले तरी live_order_manager hard-block ठेवतो.
+3) app.py साठी FLASK_SECRET_KEY किमान 32 characters चा random secret असणे आवश्यक.
+4) TRADING_AI_DB_PATH persistent Render disk path वर द्या. उदा. /var/data/trading_ai.sqlite3 (त्या path ला persistent disk mount केलेला असेल तरच).
+5) Zerodha ACCESS_TOKEN process memory मध्ये आहे; restart नंतर पुन्हा Zerodha login करावे लागेल. Multi-worker चालवू नका. Staging साठी gunicorn --workers 1 वापरा.
+6) OAuth state/PKCE, persistent encrypted token storage, order-id-level reconciliation, actual P&L reconciliation, quote freshness, and real exchange-side protective exits अजून पूर्ण/verified नाहीत.
+7) Dashboard reconciliation API authenticated + CSRF protected आहे. POST /api/execution/reconcile हा read-only Zerodha orders/positions वाचतो.
+
+Staging install:
+  pip install -r requirements.txt
+
+Render staging start command:
+  gunicorn --workers 1 --bind 0.0.0.0:$PORT app:app
+
+आवश्यक Environment Variables:
+  KITE_API_KEY
+  KITE_API_SECRET
+  FLASK_SECRET_KEY (random, >=32 chars)
+  TRADING_AI_LIVE_ENABLED=false
+  TRADING_AI_DB_PATH=/var/data/trading_ai.sqlite3 (persistent disk असल्यास)
+  TG_TOKEN / TG_CHAT_ID (ऐच्छिक)
+
+Tests (package folder मधून):
+  python -m unittest -v test_live_order_manager.py
+  python test_broker_reconciliation.py
+
+ही चाचणी फक्त module-level mock tests आहे. Render runtime, प्रत्यक्ष Zerodha login, वास्तविक broker reconciliation किंवा live trading यांची पुष्टी नाही.
